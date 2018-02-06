@@ -1,0 +1,32 @@
+
+# Special entry containing migration steps for a brand new install. Used
+# internally by create_cluster.py only during initial ODB creation. It is not
+# possible to share these step files with other migrations, because then they
+# could never be changed. Instead e.g. a feature branch introducing a new set
+# of ODB objects should have one script in migrations/initial/ and one for its
+# Git commit.
+- from_version:
+  to_version:
+  step_files:
+    # Base security and services.
+    - migrations/initial/admin_invoke.yml
+
+    # Component security and services.
+    - migrations/initial/apispec.yml
+    - migrations/initial/amqp.yml
+    - migrations/initial/jms_wmq.yml
+    - migrations/initial/websocket.yml
+    - migrations/initial/zeromq.yml
+    - migrations/initial/sio_checks.yml
+    - migrations/initial/aws_s3.yml
+    - migrations/initial/openstack_swift.yml
+    - migrations/initial/openstack_swift.yml
+
+
+# A more typical migration.
+- from_version: "xxxxxxxx"
+  to_version: "yyyyyyyy"
+  step_files:
+    - migrations/0123_example_steps.yml
+
+

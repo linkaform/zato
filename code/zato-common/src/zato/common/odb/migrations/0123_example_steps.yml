@@ -1,0 +1,67 @@
+# Example step file contents:
+- update_config_file:
+    component: SERVER           # Comes from .zato-info
+    file: config/repo/server.conf
+    sections:
+      some_obsolete_section:
+        # If the section's value is a dict, then the mode of operation is
+        # against the section itself.
+        remove: true
+
+      crypto:
+        # Otherwise it is a list of dicts, either {"section_key": literal},
+        # or a conditional like under odb.
+        - use_tls: false
+        - tls_protocol: TLSv1
+        - tls_ciphers: EECDH+AES:EDH+AES:-SHA1:EECDH+RC4
+        - tls_client_certs: optional
+
+      odb:
+        - use_async_driver: true
+
+        # Conditionally set or remove.
+        - key: engine
+          when: "section['engine'] == 'postgresql'"
+          set: postgresql+pg8000
+        - key: engine
+          when: "section['engine'] == 'sqlite'"
+          remove: true
+
+      deploy_patterns_allowed:
+        - order: false_true
+        - "*": true
+
+- call_function:
+    component: WEB_ADMIN
+    name: zato.cli.migrate.fix_up_django_thing
+
+- create_model:
+    type: zato.common.odb.models.HTTPSOAP
+    attributes:
+      name: zato.internal.callback.wmq
+      is_active: true
+      is_internal: true
+      connection: channel
+      transport: plain_http
+      url_path: /zato/internal/callback/wmq
+      soap_action: ""
+      has_rbac: false
+      sec_use_rbac: false
+      security_id:
+        type: zato.common.odb.models.SecurityBase
+        filters:
+          name: zato.connector.wmq
+      service_id: 313
+
+- update_model:
+  type: zato.common.odb.models.SecurityBase
+  filters:
+    name: zato.connector.wmq
+  attributes:
+    is_internal: false
+
+- delete_model:
+  type: zato.common.odb.models.HTTPSOAP
+  filters:
+    name: zato.internal.callback.wmq
+  cascade: true
