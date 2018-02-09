@@ -60,6 +60,17 @@ def never_if_mysql():
 
 # ################################################################################################################################
 
+def always_if_sqlite():
+    """For batch_alter_table(recreate=...), return "always" if the active database connection is SQLite, otherwise return "auto".
+    This works around errors where Alembic thinks it can skip the recreate-table method when actually SQLite will still produce
+    an error."""
+    if db_type() == 'sqlite':
+        return 'always'
+    else:
+        return 'auto'
+
+# ################################################################################################################################
+
 def drop_fk_by_shape(src_table, src_col, target_table, target_col):
     """
     Drop a ForeignKeyConstraint without knowing its name. This is used to work unnamed ForeignKeys on PG and MySQL having

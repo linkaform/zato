@@ -4,9 +4,8 @@
 # Try running ./install.sh in the configured environment.
 #
 
-set -ex
 source $TRAVIS_BUILD_DIR/.travis/setup.sh
-run bash -ec "cd /tmp/zato/code && bash -ex ./install.sh"
+run bash $BASH_TRACE $TRAVIS_BUILD_DIR/install.sh
 
 
 #
@@ -28,7 +27,7 @@ normalize() {
 }
 
 cat code/requirements.txt | normalize > /tmp/declared.txt
-run /tmp/zato/code/bin/pip freeze | normalize > /tmp/installed.txt
+run $TRAVIS_BUILD_DIR/bin/pip freeze | normalize > /tmp/installed.txt
 
 echo
 echo

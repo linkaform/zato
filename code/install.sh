@@ -34,7 +34,6 @@ function switch_to_basedir()
 
 switch_to_basedir
 
-
 #
 # Run an OS-specific installer
 #
@@ -59,3 +58,5 @@ else
     echo "install.sh: Unsupported OS: could not detect OS X, apt-get, yum, or apk." >&2
     exit 1
 fi
+
+exit 0

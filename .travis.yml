@@ -7,17 +7,18 @@ cache:
 # https://zato.io/docs/admin/guide/install/index.html#operating-system-considerations
 env:
   # For later use with matrix.include later and OS X.
+  - MODE=alembic
   #- MODE=packaging IMAGE=
-  - MODE=packaging IMAGE=centos:6
-  - MODE=packaging IMAGE=centos:7
-  - MODE=packaging IMAGE=ubuntu:12.04
-  - MODE=packaging IMAGE=ubuntu:14.04
-  - MODE=packaging IMAGE=i386/ubuntu:14.04
-  - MODE=packaging IMAGE=ubuntu:16.04
-  - MODE=packaging IMAGE=debian:7
-  - MODE=packaging IMAGE=debian:8
-  - MODE=packaging IMAGE=debian:9
-  - MODE=packaging IMAGE=alpine:3.7
+  #- MODE=packaging IMAGE=centos:6
+  #- MODE=packaging IMAGE=centos:7
+  #- MODE=packaging IMAGE=ubuntu:12.04
+  #- MODE=packaging IMAGE=ubuntu:14.04
+  #- MODE=packaging IMAGE=i386/ubuntu:14.04
+  #- MODE=packaging IMAGE=ubuntu:16.04
+  #- MODE=packaging IMAGE=debian:7
+  #- MODE=packaging IMAGE=debian:8
+  #- MODE=packaging IMAGE=debian:9
+  #- MODE=packaging IMAGE=alpine:3.7
 
 # List of operating systems to test under (second dimension)
 # https://docs.travis-ci.com/user/reference/overview/
@@ -34,6 +35,10 @@ matrix:
 
 notifications:
   email: false
+
+before_install:
+  # https://github.com/travis-ci/travis-ci/issues/7940
+  - sudo rm -f /etc/boto.cfg
 
 script:
   - source .travis/test_${MODE}.sh
