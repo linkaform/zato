@@ -2173,7 +2173,7 @@ class PubSubSubscription(Base):
         Index('pubsb_sub_clust_subk', 'cluster_id', 'sub_key', unique=True),
     {})
 
-    id = Column(Integer, Sequence('pubsub_sub_seq'), primary_key=True)
+    id = Column(Integer, Sequence('pubsub_sub_seq'), autoincrement=True, primary_key=True)
     is_internal = Column(Boolean(), nullable=False, default=False)
 
     creation_time = Column(BigInteger(), nullable=False)
