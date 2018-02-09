@@ -38,7 +38,8 @@ from zato.common import DEPLOYMENT_STATUS, Inactive, MISC, SEC_DEF_TYPE, SECRET_
 from zato.common.odb.model import APIKeySecurity, Cluster, DeployedService, DeploymentPackage, DeploymentStatus, HTTPBasicAuth, \
      HTTPSOAP, HTTSOAPAudit, JWT, OAuth, Server, Service, TLSChannelSecurity, XPathSecurity, WSSDefinition, \
      VaultConnection
-from zato.common.odb import get_ping_query, query, query_ps_subscription
+from zato.common.odb import get_ping_query, query
+from zato.common.odb.query.pubsub import subscription as query_ps_subscription
 from zato.common.util import current_host, get_component_name, get_engine_url, get_http_json_channel, get_http_soap_channel, \
      parse_extra_into_dict, parse_tls_channel_security_definition
 
@@ -974,41 +975,41 @@ class ODBManager(SessionWrapper):
 
 # ################################################################################################################################
 
-    def get_def_jms_wmq(self, cluster_id, def_id):
-        """ Returns an JMS WebSphere MQ definition's details.
+    def get_def_wmq(self, cluster_id, def_id):
+        """ Returns an IBM MQ definition's details.
         """
         with closing(self.session()) as session:
-            return query.def_jms_wmq(session, cluster_id, def_id)
+            return query.definition_wmq(session, cluster_id, def_id)
 
-    def get_def_jms_wmq_list(self, cluster_id, needs_columns=False):
-        """ Returns a list of JMS WebSphere MQ definitions on the given cluster.
+    def get_definition_wmq_list(self, cluster_id, needs_columns=False):
+        """ Returns a list of IBM MQ definitions on the given cluster.
         """
         with closing(self.session()) as session:
-            return query.def_jms_wmq_list(session, cluster_id, needs_columns)
+            return query.definition_wmq_list(session, cluster_id, needs_columns)
 
-    def get_out_jms_wmq(self, cluster_id, out_id):
-        """ Returns an outgoing JMS WebSphere MQ connection's details.
+    def get_out_wmq(self, cluster_id, out_id):
+        """ Returns an outgoing IBM MQ connection's details.
         """
         with closing(self.session()) as session:
-            return query.out_jms_wmq(session, cluster_id, out_id)
+            return query.out_wmq(session, cluster_id, out_id)
 
-    def get_out_jms_wmq_list(self, cluster_id, needs_columns=False):
-        """ Returns a list of outgoing JMS WebSphere MQ connections.
+    def get_out_wmq_list(self, cluster_id, needs_columns=False):
+        """ Returns a list of outgoing IBM MQ connections.
         """
         with closing(self.session()) as session:
-            return query.out_jms_wmq_list(session, cluster_id, needs_columns)
+            return query.out_wmq_list(session, cluster_id, needs_columns)
 
-    def get_channel_jms_wmq(self, cluster_id, channel_id):
-        """ Returns a particular JMS WebSphere MQ channel.
+    def get_channel_wmq(self, cluster_id, channel_id):
+        """ Returns a particular IBM MQ channel.
         """
         with closing(self.session()) as session:
-            return query.channel_jms_wmq(session, cluster_id, channel_id)
+            return query.channel_wmq(session, cluster_id, channel_id)
 
-    def get_channel_jms_wmq_list(self, cluster_id, needs_columns=False):
-        """ Returns a list of JMS WebSphere MQ channels.
+    def get_channel_wmq_list(self, cluster_id, needs_columns=False):
+        """ Returns a list of IBM MQ channels.
         """
         with closing(self.session()) as session:
-            return query.channel_jms_wmq_list(session, cluster_id, needs_columns)
+            return query.channel_wmq_list(session, cluster_id, needs_columns)
 
 # ################################################################################################################################
 

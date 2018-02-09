@@ -12,22 +12,17 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 from ftplib import FTP_PORT
 from json import dumps
 
-# dictalchemy
-from dictalchemy import make_class_dictable
-
 # SQLAlchemy
 from sqlalchemy import BigInteger, Boolean, Column, DateTime, Enum, ForeignKey, ForeignKeyConstraint, Index, Integer, LargeBinary, \
      Sequence, SmallInteger, String, Text, UniqueConstraint, true, false
-from sqlalchemy.ext.declarative import declarative_base
+
 from sqlalchemy.orm import backref, relationship
 
 # Zato
 from zato.common import AMQP, CASSANDRA, CLOUD, CONNECTION, DATA_FORMAT, HTTP_SOAP_SERIALIZATION_TYPE, MISC, NOTIF, \
      MSG_PATTERN_TYPE, ODOO, PUBSUB, SCHEDULER, STOMP, PARAMS_PRIORITY, URL_PARAMS_PRIORITY, URL_TYPE
 from zato.common.odb import WMQ_DEFAULT_PRIORITY
-
-Base = declarative_base()
-make_class_dictable(Base)
+from zato.common.odb.model.base import Base
 
 # ################################################################################################################################
 
@@ -885,7 +880,7 @@ class ConnDefAMQP(Base):
 # ################################################################################################################################
 
 class ConnDefWMQ(Base):
-    """ A WebSphere MQ connection definition.
+    """ A IBM MQ connection definition.
     """
     __tablename__ = 'conn_def_wmq'
     __table_args__ = (UniqueConstraint('name', 'cluster_id'), {})
@@ -896,7 +891,7 @@ class ConnDefWMQ(Base):
 
     host = Column(String(200), nullable=False)
     port = Column(Integer, nullable=False)
-    queue_manager = Column(String(200), nullable=False)
+    queue_manager = Column(String(200), nullable=True)
     channel = Column(String(200), nullable=False)
     cache_open_send_queues = Column(Boolean(), nullable=False)
     cache_open_receive_queues = Column(Boolean(), nullable=False)
@@ -906,16 +901,17 @@ class ConnDefWMQ(Base):
     ssl_cipher_spec = Column(String(200))
     ssl_key_repository = Column(String(200))
     needs_mcd = Column(Boolean(), nullable=False)
+    use_jms = Column(Boolean(), nullable=False)
     max_chars_printed = Column(Integer, nullable=False)
+    username = Column(String(100), nullable=True)
+    password = Column(String(100), nullable=True)
 
     cluster_id = Column(Integer, ForeignKey('cluster.id', ondelete='CASCADE'), nullable=False)
     cluster = relationship(Cluster, backref=backref('wmq_conn_defs', order_by=name, cascade='all, delete, delete-orphan'))
 
-    def __init__(self, id=None, name=None, host=None, port=None,
-                 queue_manager=None, channel=None, cache_open_send_queues=None,
-                 cache_open_receive_queues=None, use_shared_connections=None, ssl=None,
-                 ssl_cipher_spec=None, ssl_key_repository=None, needs_mcd=None,
-                 max_chars_printed=None, cluster_id=None):
+    def __init__(self, id=None, name=None, host=None, port=None, queue_manager=None, channel=None, cache_open_send_queues=None,
+        cache_open_receive_queues=None, use_shared_connections=None, ssl=None, ssl_cipher_spec=None, ssl_key_repository=None,
+        needs_mcd=None, max_chars_printed=None, cluster_id=None, username=None, password=None, use_jms=None):
         self.id = id
         self.name = name
         self.host = host
@@ -931,6 +927,9 @@ class ConnDefWMQ(Base):
         self.needs_mcd = needs_mcd
         self.max_chars_printed = max_chars_printed
         self.cluster_id = cluster_id
+        self.username = username
+        self.password = password
+        self.use_jms = use_jms
 
 # ################################################################################################################################
 
@@ -1064,7 +1063,7 @@ class OutgoingSTOMP(Base):
 # ################################################################################################################################
 
 class OutgoingWMQ(Base):
-    """ An outgoing WebSphere MQ connection.
+    """ An outgoing IBM MQ connection.
     """
     __tablename__ = 'out_wmq'
     __table_args__ = (UniqueConstraint('name', 'def_id'), {})
@@ -1091,7 +1090,8 @@ class OutgoingWMQ(Base):
         self.expiration = expiration
         self.def_id = def_id
         self.delivery_mode_text = delivery_mode_text # Not used by the DB
-        self.def_name = def_name # Not used by the DB
+        self.def_name = def_name # Not used by DB
+        self.def_name_full_text = None # Not used by DB
 
 # ################################################################################################################################
 
@@ -1186,7 +1186,7 @@ class ChannelSTOMP(Base):
 # ################################################################################################################################
 
 class ChannelWMQ(Base):
-    """ An incoming WebSphere MQ connection.
+    """ An incoming IBM MQ connection.
     """
     __tablename__ = 'channel_wmq'
     __table_args__ = (UniqueConstraint('name', 'def_id'), {})
