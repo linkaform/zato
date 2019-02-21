@@ -27,6 +27,9 @@ import jwt
 from zato.common.odb.model import JWT as JWT_
 from zato.server.cache import RobustCache
 
+# LIKAFORM
+import linkaform as lkf
+
 # ################################################################################################################################
 
 logger = getLogger(__name__)
@@ -36,16 +39,21 @@ logger = getLogger(__name__)
 class JWT(object):
     """ JWT authentication backend.
     """
-    ALGORITHM = 'HS256'
+    ALGORITHM = lkf.JWT_ALGORITHM
+    JWT_PUB_KEY = lkf.JWT_LKF_PUB_KEY.read()
 
 # ################################################################################################################################
 
     def __init__(self, kvdb, odb, secret):
         self.odb = odb
+        logger.info('ODB=' + str(odb))
         self.cache = RobustCache(kvdb, odb)
+        logger.info('CACHE=' + str(self.cache))
 
         self.secret = secret
+        logger.info('SECRET=' + str(secret))
         self.fernet = Fernet(self.secret)
+        logger.info('FERNET=' + str(self.fernet))
 
 # ################################################################################################################################
 
@@ -99,16 +107,38 @@ class JWT(object):
             5. renew the cache expiration asyncronouysly (do not wait for the update confirmation).
             5. return "valid" + the token contents
         """
-        if self.cache.get(token):
-            decrypted = self.fernet.decrypt(token)
-            token_data = bunchify(jwt.decode(decrypted, self.secret))
+        logger.info('USERNAME=' + expected_username)
+        logger.info('PUB_KEY=' + self.JWT_PUB_KEY)
 
+        if token:
+            options = {
+                    'verify_signature': True
+            }
+
+            token_data = bunchify(jwt.decode(token, self.JWT_PUB_KEY, lkf.JWT_VERIFY, options=options, leeway=lkf.JWT_LEEWAY))
+
+            logger.info('TOKEN_DATA_USERNAME=' + token_data.username)
             if token_data.username == expected_username:
-
-                # Renew the token expiration
-                self.cache.put(token, token, token_data.ttl, async=True)
                 return Bunch(valid=True, token=token_data)
+            else:
+                return Bunch(valid=False, message='Unexpected user for token found')
 
+        else:
+            return Bunch(valid=False, message='Invalid token')
+
+# ################################################################################################################################
+
+    def validate_token(self, token):
+        """
+	    Validate Token
+
+        """
+        if token:
+            options = { 'verify_signature': True }
+            token_data = bunchify(jwt.decode(token, self.JWT_PUB_KEY, lkf.JWT_VERIFY, options=options, leeway=lkf.JWT_LEEWAY))
+
+            if token_data:
+                return Bunch(valid=True, token=token_data)
             else:
                 return Bunch(valid=False, message='Unexpected user for token found')
 
