@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -19,6 +19,9 @@ class Encrypt(Service):
     class SimpleIO:
         input_required = ('clear_text',)
         output_required = ('encrypted',)
+
+    def handle(self):
+        self.response.payload.encrypted = self.crypto.encrypt(self.request.input.clear_text.encode('utf8'))
 
 # ################################################################################################################################
 
@@ -62,7 +65,7 @@ class GenerateSecret(Service):
 # ################################################################################################################################
 
 class GeneratePassword(Service):
-    """ Generates a new secret of input bits strength.
+    """ Generates a new password of input bits strength.
     """
     class SimpleIO:
         input_required = (Integer('bits'),)

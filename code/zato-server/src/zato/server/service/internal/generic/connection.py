@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,23 +9,27 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 # stdlib
 from contextlib import closing
 from copy import deepcopy
-from json import dumps
+from json import loads
 
 # Zato
 from zato.common.broker_message import GENERIC
 from zato.common.odb.model import GenericConn as ModelGenericConn
 from zato.common.odb.query.generic import connection_list
+from zato.common.util.json_ import dumps
 from zato.server.generic.connection import GenericConnection
 from zato.server.service import Bool, Int
 from zato.server.service.internal import AdminService, AdminSIO, ChangePasswordBase, GetListAdminSIO
 from zato.server.service.internal.generic import _BaseService
 from zato.server.service.meta import DeleteMeta
 
+# Python 2/3 compatibility
+from past.builtins import basestring
+
 # ################################################################################################################################
 
 elem = 'generic_connection'
 model = ModelGenericConn
-label = 'a connection'
+label = 'a generic connection'
 broker_message = GENERIC
 broker_message_prefix = 'CONNECTION_'
 list_func = None
@@ -53,14 +57,18 @@ class _CreateEdit(_BaseService):
 
     def handle(self):
         data = deepcopy(self.request.input)
-        for key, value in self.request.raw_request.items():
+
+        raw_request = self.request.raw_request
+        if isinstance(raw_request, basestring):
+            raw_request = loads(raw_request)
+
+        for key, value in raw_request.items():
             if key not in data:
                 data[key] = self._convert_sio_elem(key, value)
 
         conn = GenericConnection.from_dict(data)
         conn.secret = self.server.encrypt(self.crypto.generate_secret())
         conn_dict = conn.to_sql_dict()
-
 
         with closing(self.server.odb.session()) as session:
 
@@ -87,22 +95,28 @@ class _CreateEdit(_BaseService):
 # ################################################################################################################################
 
 class Create(_CreateEdit):
+    """ Creates a new generic connection.
+    """
     is_edit = False
 
 # ################################################################################################################################
 
 class Edit(_CreateEdit):
+    """ Updates an existing generic connection.
+    """
     is_edit = True
 
 # ################################################################################################################################
 
 class Delete(AdminService):
+    """ Deletes a generic connection.
+    """
     __metaclass__ = DeleteMeta
 
 # ################################################################################################################################
 
 class GetList(AdminService):
-    """ Returns a list of generic connections by their type. Includes pagination.
+    """ Returns a list of generic connections by their type; includes pagination.
     """
     _filter_by = GenericConnection.name,
 

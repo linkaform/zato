@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,7 +10,11 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 from contextlib import closing
+from logging import getLogger
 from traceback import format_exc
+
+# Python 2/3 compatibility
+from six import add_metaclass
 
 # Zato
 from zato.common import DATA_FORMAT
@@ -18,9 +22,9 @@ from zato.common.broker_message import CHANNEL
 from zato.common.odb.model import ChannelWebSocket, PubSubSubscription, PubSubTopic, Service as ServiceModel, WebSocketClient
 from zato.common.odb.query import channel_web_socket_list, channel_web_socket, service, web_socket_client, \
      web_socket_client_by_pub_id, web_socket_client_list, web_socket_sub_key_data_list
-from zato.common.util import is_port_taken, parse_extra_into_dict
+from zato.common.util import is_port_taken
 from zato.common.util.sql import elems_with_opaque
-from zato.common.util.time_ import datetime_from_ms, utcnow_as_ms
+from zato.common.util.time_ import datetime_from_ms
 from zato.server.service import AsIs, DateTime, Int, Service
 from zato.server.service.internal import AdminService, AdminSIO, GetListAdminSIO
 from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
@@ -30,6 +34,7 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'channel_web_socket'
 model = ChannelWebSocket
 label = 'a WebSocket channel'
+get_list_docs = 'WebSocket channels'
 broker_message = CHANNEL
 broker_message_prefix = 'WEB_SOCKET_'
 list_func = channel_web_socket_list
@@ -40,8 +45,21 @@ output_optional_extra = ['service_name', 'sec_type']
 # ################################################################################################################################
 
 SubscriptionTable = PubSubSubscription.__table__
-WSXChannelTable = ChannelWebSocket.__table__
 SubscriptionDelete = SubscriptionTable.delete
+
+WSXChannelTable = ChannelWebSocket.__table__
+
+WSXClientTable = WebSocketClient.__table__
+WSXClientDelete = WSXClientTable.delete
+
+# ################################################################################################################################
+
+logger_pubsub = getLogger('zato_pubsub.srv')
+
+# ################################################################################################################################
+
+def _get_hook_service(self):
+    return self.server.fs_server_config.get('wsx', {}).get('hook_service', '')
 
 # ################################################################################################################################
 
@@ -57,13 +75,14 @@ def broker_message_hook(self, input, instance, attrs, service_type):
         input.sec_type = full_data.sec_type
         input.sec_name = full_data.sec_name
         input.vault_conn_default_auth_method = full_data.vault_conn_default_auth_method
+        input.hook_service = _get_hook_service(self)
 
 # ################################################################################################################################
 
 def instance_hook(self, input, instance, attrs):
 
     if attrs.is_create_edit:
-        instance.hook_service = self.server.fs_server_config.get('wsx', {}).get('hook_service', '')
+        instance.hook_service = _get_hook_service(self)
         instance.is_out = False
         instance.service = attrs._meta_session.query(ServiceModel).\
             filter(ServiceModel.name==input.service_name).\
@@ -80,24 +99,27 @@ def response_hook(self, input, _ignored_instance, attrs, service_type):
 
 # ################################################################################################################################
 
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = ChannelWebSocket.name,
-    __metaclass__ = GetListMeta
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
 
 # ################################################################################################################################
 
@@ -105,9 +127,8 @@ class Start(Service):
     """ Starts a WebSocket channel.
     """
     class SimpleIO(object):
-        input_required = tuple(Edit.SimpleIO.input_required) + ('id', 'config_cid')
-        input_optional = tuple(Edit.SimpleIO.input_optional) + (
-            Int('bind_port'), 'service_name', 'sec_name', 'sec_type', 'vault_conn_default_auth_method')
+        input_required = 'id', 'config_cid'
+        input_optional = Int('bind_port'), 'service_name', 'sec_name', 'sec_type', 'vault_conn_default_auth_method'
         request_elem = 'zato_channel_web_socket_start_request'
         response_elem = 'zato_channel_web_socket_start_response'
 
@@ -263,43 +284,5 @@ class GetSubKeyDataList(AdminService):
             for item in data:
                 item.creation_time = datetime_from_ms(item.creation_time * 1000)
             self.response.payload[:] = data
-
-# ################################################################################################################################
-
-class CleanupWSXPubSub(AdminService):
-    """ Deletes all old WSX clients and their subscriptions.
-    """
-    name = 'pub.zato.channel.web-socket.cleanup-wsx-pub-sub'
-
-    def handle(self):
-
-        # We receive a multi-line list of WSX channel name -> max timeout accepted on input
-        config = parse_extra_into_dict(self.request.raw_request)
-
-        with closing(self.odb.session()) as session:
-
-            # Delete stale connections for each subscriber
-            for channel_name, max_delta in config.items():
-
-                # Input timeout is in minutes but timestamps in ODB are in seconds
-                # so we convert the minutes to seconds, as expected by the database.
-                max_delta = max_delta * 60
-
-                # We compare everything using seconds
-                now = utcnow_as_ms()
-
-                # Laster interaction time for each connection must not be older than that many seconds ago
-                max_allowed = now - max_delta
-
-                # Delete old connections for that channel
-                session.execute(
-                    SubscriptionDelete().\
-                    where(SubscriptionTable.c.ws_channel_id==WSXChannelTable.c.id).\
-                    where(WSXChannelTable.c.name==channel_name).\
-                    where(SubscriptionTable.c.last_interaction_time < max_allowed)
-                )
-
-            # Commit all deletions
-            session.commit()
 
 # ################################################################################################################################

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -172,7 +172,8 @@ def index(req):
             'connection': connection,
             'transport': transport,
             'paginate': True,
-            'cur_page': req.GET.get('cur_page', 1)
+            'cur_page': req.GET.get('cur_page', 1),
+            'query': req.GET.get('query', ''),
         }
 
         data, meta = parse_response_data(req.zato.client.invoke('zato.http-soap.get-list', input_dict))
@@ -251,8 +252,8 @@ def create(req):
                 req.POST['transport'], req.POST['connection'], req.POST['name'])
         else:
             raise ZatoException(msg=response.details)
-    except Exception, e:
-        msg = 'Could not create the object, e:[{e}]'.format(e=format_exc(e))
+    except Exception:
+        msg = 'Object could not be created, e:`{}`'.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
 
@@ -265,8 +266,8 @@ def edit(req):
                 req.POST['transport'], req.POST['connection'], req.POST['edit-name'])
         else:
             raise ZatoException(msg=response.details)
-    except Exception, e:
-        msg = 'Could not perform the update, e:`{}`'.format(format_exc(e))
+    except Exception:
+        msg = 'Update error, e:`{}`'.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
 

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -12,6 +12,9 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import logging
 from contextlib import closing
 from traceback import format_exc
+
+# Python 2/3 compatibility
+from past.builtins import basestring
 
 # Zato
 from zato.common import SECRET_SHADOW, zato_namespace, ZATO_NONE
@@ -52,10 +55,25 @@ class SearchTool(object):
 
 # ################################################################################################################################
 
+class AdminSIO(object):
+    namespace = zato_namespace
+
+# ################################################################################################################################
+
+class GetListAdminSIO(object):
+    namespace = zato_namespace
+    input_optional = (Int('cur_page'), Bool('paginate'), 'query')
+
+# ################################################################################################################################
+
 class AdminService(Service):
     """ A Zato admin service, part of the Zato public API.
     """
     output_optional = ('_meta',)
+
+    class SimpleIO(AdminSIO):
+        """ This empty definition is needed in case the service should be invoked through REST.
+        """
 
     def __init__(self):
         super(AdminService, self).__init__()
@@ -91,7 +109,7 @@ class AdminService(Service):
 # ################################################################################################################################
 
     def handle(self, *args, **kwargs):
-        raise NotImplementedError('Should be overridden by subclasses')
+        raise NotImplementedError('Should be overridden by subclasses (AdminService.handle)')
 
 # ################################################################################################################################
 
@@ -106,11 +124,12 @@ class AdminService(Service):
 # ################################################################################################################################
 
     def after_handle(self):
+
         payload = self.response.payload
-        is_basestring = isinstance(payload, basestring)
+        is_text = isinstance(payload, basestring)
         needs_meta = self.request.input.get('needs_meta', True)
 
-        if needs_meta and hasattr(self, '_search_tool') and not is_basestring:
+        if needs_meta and hasattr(self, '_search_tool') and not is_text:
             payload.zato_meta = self._search_tool.output_meta
 
         logger.info(
@@ -119,7 +138,7 @@ class AdminService(Service):
 # ################################################################################################################################
 
     def get_data(self, *args, **kwargs):
-        raise NotImplementedError('Should be overridden by subclasses')
+        raise NotImplementedError('Should be overridden by subclasses (AdminService.get_data)')
 
 # ################################################################################################################################
 
@@ -139,18 +158,9 @@ class AdminService(Service):
 
 # ################################################################################################################################
 
-class AdminSIO(object):
-    namespace = zato_namespace
-
-# ################################################################################################################################
-
-class GetListAdminSIO(object):
-    namespace = zato_namespace
-    input_optional = (Int('cur_page'), Bool('paginate'), 'query')
-
-# ################################################################################################################################
-
 class Ping(AdminService):
+    """ A ping service, useful for API testing.
+    """
     class SimpleIO(AdminSIO):
         output_required = ('pong',)
         response_elem = 'zato_ping_response'
@@ -170,6 +180,8 @@ class Ping(AdminService):
 # ################################################################################################################################
 
 class Ping2(Ping):
+    """ Works exactly the same as zato.ping, added to have another service for API testing.
+    """
     class SimpleIO(Ping.SimpleIO):
         response_elem = 'zato_ping2_response'
 

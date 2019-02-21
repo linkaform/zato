@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -53,7 +53,7 @@ def get_columns_to_visit(columns, is_required):
     out = []
 
     # Models with inheritance may have multiple attributes of the same name,
-    # e.g. VaultConnection.id will have SecBase.id and we need to make sure only one of the is returned.
+    # e.g. VaultConnection.id will have SecBase.id and we need to make sure only one of them is returned.
     names_seen = set()
 
     for elem in columns:
@@ -151,6 +151,7 @@ def update_attrs(cls, name, attrs):
     attrs.check_existing_one = getattr(mod, 'check_existing_one', True)
     attrs.request_as_is = getattr(mod, 'request_as_is', [])
     attrs.sio_default_value = getattr(mod, 'sio_default_value', None)
+    attrs.get_list_docs = getattr(mod, 'get_list_docs', None)
     attrs._meta_session = None
 
     attrs.is_create = False
@@ -224,17 +225,17 @@ class AdminServiceMeta(type):
                     sio_elem.extend(attrs.create_edit_input_required_extra)
 
                 # Sorts and removes duplicates
-                setattr(SimpleIO, _name, sorted(list(set(sio_elem))))
+                setattr(SimpleIO, _name, list(set(sio_elem)))
 
         for skip_name in attrs.skip_output_params:
             for attr_names in chain([SimpleIO.output_required, SimpleIO.output_optional]):
                 if skip_name in attr_names:
                     attr_names.remove(skip_name)
 
-        SimpleIO.input_required = tuple(sorted(SimpleIO.input_required))
-        SimpleIO.input_optional = tuple(sorted(SimpleIO.input_optional))
-        SimpleIO.output_required = tuple(sorted(SimpleIO.output_required))
-        SimpleIO.output_optional = tuple(sorted(SimpleIO.output_optional))
+        SimpleIO.input_required = tuple(SimpleIO.input_required)
+        SimpleIO.input_optional = tuple(SimpleIO.input_optional)
+        SimpleIO.output_required = tuple(SimpleIO.output_required)
+        SimpleIO.output_optional = tuple(SimpleIO.output_optional)
 
         return SimpleIO
 
@@ -243,6 +244,7 @@ class GetListMeta(AdminServiceMeta):
     """
     def __init__(cls, name, bases, attrs):
         attrs = update_attrs(cls, name, attrs)
+        cls.__doc__ = 'Returns a list of {}.'.format(attrs.get_list_docs)
         cls.SimpleIO = GetListMeta.get_sio(attrs, name, is_list=True)
         cls.handle = GetListMeta.handle(attrs)
         cls.get_data = GetListMeta.get_data(attrs.get_data_func)
@@ -271,6 +273,8 @@ class CreateEditMeta(AdminServiceMeta):
 
     def __init__(cls, name, bases, attrs):
         attrs = update_attrs(cls, name, attrs)
+        verb = 'Creates' if attrs.is_create else 'Updates'
+        cls.__doc__ = '{} {}.'.format(verb, attrs.label)
         cls.SimpleIO = CreateEditMeta.get_sio(attrs, name)
         cls.handle = CreateEditMeta.handle(attrs)
         return super(CreateEditMeta, cls).__init__(cls)
@@ -330,9 +334,9 @@ class CreateEditMeta(AdminServiceMeta):
                     session.add(instance)
                     session.commit()
 
-                except Exception, e:
+                except Exception:
                     msg = 'Could not {} the object, e:`%s`'.format(verb)
-                    logger.error(msg, format_exc(e))
+                    logger.error(msg, format_exc())
                     session.rollback()
                     raise
                 else:
@@ -366,6 +370,7 @@ class CreateEditMeta(AdminServiceMeta):
 class DeleteMeta(AdminServiceMeta):
     def __init__(cls, name, bases, attrs):
         attrs = update_attrs(cls, name, attrs)
+        cls.__doc__ = 'Deletes {}.'.format(attrs.label)
         cls.SimpleIO = DeleteMeta.get_sio(attrs, name, ['id'], [])
         cls.handle = DeleteMeta.handle(attrs)
         return super(DeleteMeta, cls).__init__(cls)
@@ -386,9 +391,9 @@ class DeleteMeta(AdminServiceMeta):
 
                     session.delete(instance)
                     session.commit()
-                except Exception, e:
+                except Exception:
                     msg = 'Could not delete {}, e:`%s`'.format(attrs.label)
-                    self.logger.error(msg, format_exc(e))
+                    self.logger.error(msg, format_exc())
                     session.rollback()
 
                     raise

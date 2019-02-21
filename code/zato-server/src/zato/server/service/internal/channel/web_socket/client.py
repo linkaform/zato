@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2016, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -92,14 +92,16 @@ class UnregisterWSSubKey(AdminService):
     """ Notifies all workers about sub keys that will not longer be accessible because current WSX client disconnects.
     """
     class SimpleIO(AdminSIO):
-        input_required = (List('sub_key_list'),)
+        input_required = List('sub_key_list')
+        input_optional = 'needs_wsx_close'
 
     def handle(self):
 
         # If configured to, delete the WebSocket's persistent subscription
         for sub_key in self.request.input.sub_key_list:
             sub = self.pubsub.get_subscription_by_sub_key(sub_key)
-            if sub.unsub_on_wsx_close:
+
+            if self.request.input.needs_wsx_close or sub.unsub_on_wsx_close:
                 self.invoke('zato.pubsub.pubapi.unsubscribe',{
                     'sub_key': sub.sub_key,
                     'topic_name': sub.topic_name,
@@ -116,10 +118,14 @@ class UnregisterWSSubKey(AdminService):
 class DeleteByServer(AdminService):
     """ Deletes information about a previously established WebSocket connection. Called when a server shuts down.
     """
+    class SimpleIO(AdminSIO):
+        input_required = 'needs_pid',
+
     def handle(self):
 
         with closing(self.odb.session()) as session:
-            clients = web_socket_clients_by_server_id(session, self.server.id)
+            server_pid = self.server.pid if self.request.input.needs_pid else None
+            clients = web_socket_clients_by_server_id(session, self.server.id, server_pid)
             clients.delete()
             session.commit()
 
@@ -138,8 +144,26 @@ class NotifyPubSubMessage(AdminService):
         try:
             self.response.payload.r = self.server.worker_store.web_socket_api.notify_pubsub_message(
                 req.channel_name, self.cid, req.pub_client_id, req.request)
-        except Exception, e:
-            self.logger.warn(format_exc(e))
+        except Exception:
+            self.logger.warn(format_exc())
             raise
+
+# ################################################################################################################################
+
+class SetLastSeen(AdminService):
+    """ Sets last_seen for input WSX client.
+    """
+    class SimpleIO(AdminSIO):
+        input_required = 'id', 'last_seen'
+
+    def handle(self):
+
+        with closing(self.odb.session()) as session:
+            session.execute(
+                _wsx_client_table.update().\
+                values(last_seen=self.request.input.last_seen).\
+                where(_wsx_client_table.c.id==self.request.input.id))
+
+            session.commit()
 
 # ################################################################################################################################

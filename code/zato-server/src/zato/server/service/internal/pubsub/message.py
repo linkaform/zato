@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -383,6 +383,8 @@ class UpdateNonGD(_Update):
 # ################################################################################################################################
 
 class GetFromQueueGD(AdminService):
+    """ Returns a GD pub/sub topic message by its ID.
+    """
     class SimpleIO(AdminSIO):
         input_required = ('cluster_id', AsIs('msg_id'))
         output_optional = (AsIs('msg_id'), 'recv_time', 'data', Int('delivery_count'), 'last_delivery_time',

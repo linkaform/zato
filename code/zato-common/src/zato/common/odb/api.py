@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -12,19 +12,15 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import logging
 from contextlib import closing
 from copy import deepcopy
-from cStringIO import StringIO
-from datetime import datetime, timedelta
+from datetime import datetime
+from io import StringIO
 from logging import DEBUG, getLogger
 from threading import RLock
 from time import time
 from traceback import format_exc
 
-# Spring Python
-from springpython.context import DisposableObject
-
 # SQLAlchemy
-from sqlalchemy import create_engine, event
-from sqlalchemy.exc import IntegrityError, ProgrammingError
+from sqlalchemy import and_, create_engine, event, select
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.orm.query import Query
 from sqlalchemy.pool import NullPool
@@ -34,12 +30,12 @@ from sqlalchemy.sql.expression import true
 from bunch import Bunch
 
 # Zato
-from zato.common import DEPLOYMENT_STATUS, Inactive, MISC, PUBSUB, SEC_DEF_TYPE, SECRET_SHADOW, SERVER_UP_STATUS, TRACE1, \
+from zato.common import DEPLOYMENT_STATUS, Inactive, MISC, PUBSUB, SEC_DEF_TYPE, SECRET_SHADOW, SERVER_UP_STATUS, \
      ZATO_NONE, ZATO_ODB_POOL_NAME
+from zato.common.odb import get_ping_query, query
 from zato.common.odb.model import APIKeySecurity, Cluster, DeployedService, DeploymentPackage, DeploymentStatus, HTTPBasicAuth, \
      JWT, OAuth, PubSubEndpoint, SecurityBase, Server, Service, TLSChannelSecurity, XPathSecurity, \
      WSSDefinition, VaultConnection
-from zato.common.odb import get_ping_query, query
 from zato.common.odb.query.pubsub import subscription as query_ps_subscription
 from zato.common.odb.query import generic as query_generic
 from zato.common.util import current_host, get_component_name, get_engine_url, parse_extra_into_dict, \
@@ -52,11 +48,19 @@ logger = logging.getLogger(__name__)
 
 # ################################################################################################################################
 
+ServiceTable = Service.__table__
+ServiceTableInsert = ServiceTable.insert
+
+DeployedServiceTable = DeployedService.__table__
+DeployedServiceInsert = DeployedServiceTable.insert
+DeployedServiceDelete = DeployedServiceTable.delete
+
+# ################################################################################################################################
+# ################################################################################################################################
+
 # Based on https://bitbucket.org/zzzeek/sqlalchemy/wiki/UsageRecipes/WriteableTuple
 
 class WritableKeyedTuple(object):
-
-# ################################################################################################################################
 
     def __init__(self, elem):
         object.__setattr__(self, '_elem', elem)
@@ -89,6 +93,7 @@ class WritableKeyedTuple(object):
         return 'WritableKeyedTuple(%s)' % (', '.join('%r=%r' % (key, value) for (key, value) in inner + outer))
 
 # ################################################################################################################################
+# ################################################################################################################################
 
 class WritableTupleQuery(Query):
 
@@ -101,6 +106,7 @@ class WritableTupleQuery(Query):
         else:
             return it
 
+# ################################################################################################################################
 # ################################################################################################################################
 
 class SessionWrapper(object):
@@ -119,9 +125,9 @@ class SessionWrapper(object):
 
         try:
             self.pool.ping(self.fs_sql_config)
-        except Exception, e:
+        except Exception:
             msg = 'Could not ping:`%s`, session will be left uninitialized, e:`%s`'
-            self.logger.warn(msg, name, format_exc(e))
+            self.logger.warn(msg, name, format_exc())
         else:
             if use_scoped_session:
                 self._Session = scoped_session(sessionmaker(bind=self.pool.engine, query_cls=WritableTupleQuery))
@@ -153,7 +159,9 @@ class SQLConnectionPool(object):
         # Safe for printing out to logs, any sensitive data has been shadowed
         self.config_no_sensitive = config_no_sensitive
 
-        _extra = {}
+        _extra = {
+            'pool_pre_ping': True # Make sure SQLAlchemy 1.2+ can refresh connections on transient errors
+        }
 
         # MySQL only
         if self.engine_name.startswith('mysql'):
@@ -219,8 +227,8 @@ class SQLConnectionPool(object):
             try:
                 session = mxServerSession(config_data=config_data)
                 odbc = session.open()
-            except OperationalError, e:
-                self.logger.warn('SQL connection could not be created, caught mxODBC exception, e:`%s`', format_exc(e))
+            except OperationalError:
+                self.logger.warn('SQL connection could not be created, caught mxODBC exception, e:`%s`', format_exc())
             else:
                 url = '{engine}://{username}:{password}@{db_name}'.format(**config)
                 return create_engine(url, module=odbc, **extra)
@@ -298,12 +306,11 @@ class SQLConnectionPool(object):
 
 # ################################################################################################################################
 
-class PoolStore(DisposableObject):
+class PoolStore(object):
     """ A main class for accessing all of the SQL connection pools. Each server
     thread has its own store.
     """
     def __init__(self, sql_conn_class=SQLConnectionPool):
-        super(PoolStore, self).__init__()
         self.sql_conn_class = sql_conn_class
         self._lock = RLock()
         self.wrappers = {}
@@ -383,8 +390,8 @@ class PoolStore(DisposableObject):
 
 # ################################################################################################################################
 
-    def destroy(self):
-        """ Invoked when Spring Python's container is releasing the store.
+    def cleanup_on_stop(self):
+        """ Invoked when the server is stopping.
         """
         with self._lock:
             for name, wrapper in self.wrappers.items():
@@ -439,6 +446,7 @@ class ODBManager(SessionWrapper):
 
         with closing(self.session()) as session:
             try:
+
                 server = session.query(Server).\
                        filter(Server.token == self.token).\
                        one()
@@ -448,7 +456,7 @@ class ODBManager(SessionWrapper):
                 self.cluster_id = server.cluster.id
                 return self.server
             except Exception:
-                msg = 'Could not find the server in the ODB, token:[{0}]'.format(
+                msg = 'Could not find server in ODB, token:`{}`'.format(
                     self.token)
                 logger.error(msg)
                 raise
@@ -619,31 +627,66 @@ class ODBManager(SessionWrapper):
 
 # ################################################################################################################################
 
-    def add_service(self, name, impl_name, is_internal, deployment_time, details, source_info):
-        """ Adds information about the server's service into the ODB.
+    def get_sql_internal_service_list(self, cluster_id):
+        """ Returns a list of service name and IDs for input cluster ID. It represents what is currently found in the ODB
+        and is used during server startup to decide if any new services should be added from what is found in the filesystem.
         """
-        try:
-            service = Service(None, name, True, impl_name, is_internal, self.cluster)
-            self._session.add(service)
-            try:
-                self._session.commit()
-            except(IntegrityError, ProgrammingError), e:
-                logger.log(TRACE1, 'IntegrityError (Service), e:[%s]', format_exc(e).decode('utf-8'))
-                self._session.rollback()
+        with closing(self.session()) as session:
+            return session.query(
+                Service.id,
+                Service.impl_name,
+                Service.is_active,
+                Service.slow_threshold,
+                ).\
+                filter(Service.cluster_id==cluster_id).\
+                all()
 
-                service = self._session.query(Service).\
-                    join(Cluster, Service.cluster_id==Cluster.id).\
-                    filter(Service.name==name).\
-                    filter(Cluster.id==self.cluster.id).\
-                    one()
+# ################################################################################################################################
 
-            self.add_deployed_service(deployment_time, details, service, source_info)
+    def get_basic_data_service_list(self):
+        """ Returns basic information about all the services in ODB.
+        """
+        with closing(self.session()) as session:
 
-            return service.id, service.is_active, service.slow_threshold
+            query = select([
+                ServiceTable.c.id,
+                ServiceTable.c.name,
+                ServiceTable.c.impl_name,
+            ]).where(
+                ServiceTable.c.cluster_id==self.cluster_id
+            )
 
-        except Exception, e:
-            logger.error('Could not add service, name:[%s], e:[%s]', name, format_exc(e).decode('utf-8'))
-            self._session.rollback()
+            return session.execute(query).\
+                fetchall()
+
+# ################################################################################################################################
+
+    def get_basic_data_deployed_service_list(self):
+        """ Returns basic information about all the deployed services in ODB.
+        """
+        with closing(self.session()) as session:
+
+            query = select([
+                ServiceTable.c.name,
+            ]).where(and_(
+                DeployedServiceTable.c.service_id==ServiceTable.c.id,
+                DeployedServiceTable.c.server_id==self.server_id
+            ))
+
+            return session.execute(query).\
+                fetchall()
+
+# ################################################################################################################################
+
+    def add_services(self, session, data):
+        # type: (List[dict]) -> None
+        session.execute(ServiceTableInsert().values(data))
+
+# ################################################################################################################################
+
+    def add_deployed_services(self, session, data):
+        # type: (List[dict]) -> None
+        session.execute(DeployedServiceInsert().values(data))
 
 # ################################################################################################################################
 
@@ -651,46 +694,11 @@ class ODBManager(SessionWrapper):
         """ Removes all the deployed services from a server.
         """
         with closing(self.session()) as session:
-            session.query(DeployedService).\
-                filter(DeployedService.server_id==server_id).\
-                delete()
+            session.execute(
+                DeployedServiceDelete().\
+                where(DeployedService.server_id==server_id)
+            )
             session.commit()
-
-# ################################################################################################################################
-
-    def add_deployed_service(self, deployment_time, details, service, source_info):
-        """ Adds information about the server's deployed service into the ODB.
-        """
-        try:
-            ds = DeployedService(deployment_time, details, self.server.id, service,
-                source_info.source, source_info.path, source_info.hash, source_info.hash_method)
-            self._session.add(ds)
-            try:
-                self._session.commit()
-            except(IntegrityError, ProgrammingError), e:
-
-                logger.log(TRACE1, 'IntegrityError (DeployedService), e:[%s]', format_exc(e).decode('utf-8'))
-                self._session.rollback()
-
-                ds = self._session.query(DeployedService).\
-                    filter(DeployedService.service_id==service.id).\
-                    filter(DeployedService.server_id==self.server.id).\
-                    one()
-
-                ds.deployment_time = deployment_time
-                ds.details = details
-                ds.source = source_info.source
-                ds.source_path = source_info.path
-                ds.source_hash = source_info.hash
-                ds.source_hash_method = source_info.hash_method
-
-                self._session.add(ds)
-                self._session.commit()
-
-        except Exception, e:
-            msg = 'Could not add the DeployedService, e:[{e}]'.format(e=format_exc(e))
-            logger.error(msg)
-            self._session.rollback()
 
 # ################################################################################################################################
 
@@ -738,84 +746,6 @@ class ODBManager(SessionWrapper):
             session.commit()
 
             return dp.id
-
-# ################################################################################################################################
-
-    def _become_cluster_wide(self, cluster, session):
-        """ Update all the Cluster's attributes that are related to connector servers.
-        """
-        cluster.cw_srv_id = self.server.id
-        cluster.cw_srv_keep_alive_dt = datetime.utcnow()
-
-        session.add(cluster)
-        session.commit()
-
-        msg = 'Server id:[{}], name:[{}] is now a connector server for cluster id:[{}], name:[{}]'.format(
-            self.server.id, self.server.name, cluster.id, cluster.name)
-        logger.info(msg)
-
-        return True
-
-# ################################################################################################################################
-
-    def conn_server_past_grace_time(self, cluster, grace_time):
-        """ Whether it's already past the grace time the connector server had
-        for updating its keep-alive timestamp.
-        """
-        last_keep_alive = cluster.cw_srv_keep_alive_dt
-        max_allowed = last_keep_alive + timedelta(seconds=grace_time)
-        now = datetime.utcnow()
-
-        msg = 'last_keep_alive:[{}], grace_time:[{}], max_allowed:[{}], now:[{}]'.format(
-            last_keep_alive, grace_time, max_allowed, now)
-        logger.info(msg)
-
-        # Return True if 'now' is past what it's allowed
-        return now > max_allowed
-
-# ################################################################################################################################
-
-    def become_cluster_wide(self, grace_time):
-        """ Makes an attempt for the server to become a connector one, that is,
-        the server to start all the connectors.
-        """
-        with closing(self.session()) as session:
-            cluster = session.query(Cluster).\
-                with_lockmode('update').\
-                filter(Cluster.id == self.server.cluster_id).\
-                one()
-
-            # No cluster-wide singleton server at all so we made it first
-            if not cluster.cw_srv_id:
-                return self._become_cluster_wide(cluster, session)
-            elif self.conn_server_past_grace_time(cluster, grace_time):
-                return self._become_cluster_wide(cluster, session)
-            else:
-                session.rollback()
-                msg = ('Server id:[{}], name:[{}] will not be a connector server for '
-                'cluster id:[{}], name:[{}], cluster.cw_srv_id:[{}], cluster.cw_srv_keep_alive_dt:[{}]').format(
-                    self.server.id, self.server.name, cluster.id, cluster.name, cluster.cw_srv_id, cluster.cw_srv_keep_alive_dt)
-                logger.debug(msg)
-
-# ################################################################################################################################
-
-    def clear_cluster_wide(self):
-        """ Invoked when the cluster-wide singleton server is making a clean shutdown, sets
-        all the relevant data to NULL in the ODB.
-        """
-        with closing(self.session()) as session:
-            cluster = session.query(Cluster).\
-                with_lockmode('update').\
-                filter(Cluster.id == self.server.cluster_id).\
-                one()
-
-            cluster.cw_srv_id = None
-            cluster.cw_srv_keep_alive_dt = None
-
-            session.add(cluster)
-            session.commit()
-
-            self.logger.info('({}) Cleared cluster-wide singleton server flag'.format(self.server.name))
 
 # ################################################################################################################################
 

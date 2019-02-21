@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 
+from __future__ import absolute_import, division, print_function, unicode_literals
+
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -24,34 +26,44 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 
 # stdlib
 import logging
+import os
+import signal
 import sys
-from json import dumps, loads
+from http.client import BAD_REQUEST, FORBIDDEN, INTERNAL_SERVER_ERROR, NOT_ACCEPTABLE, OK, responses, SERVICE_UNAVAILABLE
+from json import loads
 from logging import DEBUG, Formatter, getLogger, StreamHandler
 from logging.handlers import RotatingFileHandler
 from os import getppid, path
-from thread import start_new_thread
 from threading import RLock
 from time import sleep
 from traceback import format_exc
 from wsgiref.simple_server import make_server
-import httplib
 
 # Bunch
 from bunch import bunchify
 
 # Requests
-from requests import post
+from requests import post as requests_post
 
 # YAML
 import yaml
 
+# Python 2/3 compatibility
+from builtins import bytes
+from six import PY2
+from zato.common.py23_ import start_new_thread
+
 # Zato
-from zato.common.util.auth import parse_basic_auth
 from zato.common.broker_message import code_to_name
-from zato.common.zato_keyutils import KeyUtils
+from zato.common.util import parse_cmd_line_options
+from zato.common.util.auth import parse_basic_auth
+from zato.common.util.json_ import dumps
+from zato.common.util.posix_ipc_ import ConnectorConfigIPC
 from zato.server.connection.jms_wmq.jms import WebSphereMQException, NoMessageAvailableException
 from zato.server.connection.jms_wmq.jms.connection import WebSphereMQConnection
 from zato.server.connection.jms_wmq.jms.core import TextMessage
+
+logger_zato = logging.getLogger('zato')
 
 # ################################################################################################################################
 
@@ -73,12 +85,12 @@ default_logging_config = {
 
 # ################################################################################################################################
 
-_http_200 = b'{} {}'.format(httplib.OK, httplib.responses[httplib.OK])
-_http_400 = b'{} {}'.format(httplib.BAD_REQUEST, httplib.responses[httplib.BAD_REQUEST])
-_http_403 = b'{} {}'.format(httplib.FORBIDDEN, httplib.responses[httplib.FORBIDDEN])
-_http_406 = b'{} {}'.format(httplib.NOT_ACCEPTABLE, httplib.responses[httplib.NOT_ACCEPTABLE])
-_http_500 = b'{} {}'.format(httplib.INTERNAL_SERVER_ERROR, httplib.responses[httplib.INTERNAL_SERVER_ERROR])
-_http_503 = b'{} {}'.format(httplib.SERVICE_UNAVAILABLE, httplib.responses[httplib.SERVICE_UNAVAILABLE])
+_http_200 = '{} {}'.format(OK, responses[OK])
+_http_400 = '{} {}'.format(BAD_REQUEST, responses[BAD_REQUEST])
+_http_403 = '{} {}'.format(FORBIDDEN, responses[FORBIDDEN])
+_http_406 = '{} {}'.format(NOT_ACCEPTABLE, responses[NOT_ACCEPTABLE])
+_http_500 = '{} {}'.format(INTERNAL_SERVER_ERROR, responses[INTERNAL_SERVER_ERROR])
+_http_503 = '{} {}'.format(SERVICE_UNAVAILABLE, responses[SERVICE_UNAVAILABLE])
 
 _path_api = '/api'
 _path_ping = '/ping'
@@ -110,7 +122,7 @@ class _MessageCtx(object):
 
 # ################################################################################################################################
 
-class WebSphereMQChannel(object):
+class IBMMQChannel(object):
     """ A process to listen for messages from IBM MQ queue managers.
     """
     def __init__(self, conn, channel_id, queue_name, service_name, data_format, on_message_callback, logger):
@@ -217,6 +229,12 @@ class ConnectionContainer(object):
         else:
             self.pymqi = pymqi
 
+        zato_options = sys.argv[1]
+        zato_options = parse_cmd_line_options(zato_options)
+
+        self.deployment_key = zato_options['deployment_key']
+        self.shmem_size = int(zato_options['shmem_size'])
+
         self.host = '127.0.0.1'
         self.port = None
         self.username = None
@@ -230,7 +248,9 @@ class ConnectionContainer(object):
         self.lock = RLock()
         self.logger = None
         self.parent_pid = getppid()
-        self.keyutils = KeyUtils('zato-wmq', self.parent_pid)
+
+        self.config_ipc = ConnectorConfigIPC()
+        self.config_ipc.create(self.deployment_key, self.shmem_size, False)
 
         self.connections = {}
         self.outconns = {}
@@ -243,9 +263,10 @@ class ConnectionContainer(object):
         self.set_config()
 
     def set_config(self):
-        """ Sets self attributes, as configured in keyring by our parent process.
+        """ Sets self attributes, as configured in shmem by our parent process.
         """
-        config = self.keyutils.user_get()
+        config = self.config_ipc.get_config('zato-ibm-mq')
+
         config = loads(config)
         config = bunchify(config)
 
@@ -295,14 +316,20 @@ class ConnectionContainer(object):
 
 # ################################################################################################################################
 
-    def on_mq_message_received(self, msg_ctx, _post=post):
-        _post(self.server_address, data=dumps({
+    def _post(self, msg, _post=requests_post):
+        self.logger.info('POST to `%s` (%s), msg:`%s`', self.server_address, self.username, msg)
+        _post(self.server_address, data=dumps(msg), auth=self.server_auth)
+
+# ################################################################################################################################
+
+    def on_mq_message_received(self, msg_ctx):
+        return self._post({
             'msg': msg_ctx.mq_msg.to_dict(),
             'channel_id': msg_ctx.channel_id,
             'queue_name': msg_ctx.queue_name,
             'service_name': msg_ctx.service_name,
             'data_format': msg_ctx.data_format,
-        }), auth=self.server_auth)
+            })
 
 # ################################################################################################################################
 
@@ -417,7 +444,7 @@ class ConnectionContainer(object):
             try:
                 conn = self.connections[msg.id]
                 conn.close()
-                conn.password = msg.password
+                conn.password = str(msg.password)
                 conn.connect()
             except Exception as e:
                 self.logger.warn(format_exc())
@@ -432,7 +459,7 @@ class ConnectionContainer(object):
         """
         try:
             self.connections[msg.id].ping()
-        except WebSphereMQException, e:
+        except WebSphereMQException as e:
             return Response(_http_503, str(e.message), 'text/plain')
         else:
             return Response()
@@ -555,12 +582,11 @@ class ConnectionContainer(object):
                     # Resubmit the request
                     return self._on_OUTGOING_WMQ_SEND(msg, is_reconnect=True)
                 else:
-                    raise
+                    return self._on_send_exception()
 
             except Exception as e:
-                exc = format_exc()
-                self.logger.warn(exc)
-                return Response(_http_503, exc)
+                return self._on_send_exception()
+
 
 # ################################################################################################################################
 
@@ -569,7 +595,7 @@ class ConnectionContainer(object):
         """
         with self.lock:
             conn = self.connections[msg.def_id]
-            channel = WebSphereMQChannel(conn, msg.id, msg.queue.encode('utf8'), msg.service_name, msg.data_format,
+            channel = IBMMQChannel(conn, msg.id, msg.queue.encode('utf8'), msg.service_name, msg.data_format,
                 self.on_mq_message_received, self.logger)
             channel.start()
             self.channels[channel.id] = channel
@@ -608,6 +634,13 @@ class ConnectionContainer(object):
 
 # ################################################################################################################################
 
+    def _on_send_exception(self):
+        msg = 'Exception in _on_OUTGOING_WMQ_SEND (2) `{}`'.format(format_exc())
+        self.logger.warn(msg)
+        return Response(_http_503, msg)
+
+# ################################################################################################################################
+
     def handle_http_request(self, path, msg, ok=b'OK'):
         """ Dispatches incoming HTTP requests - either reconfigures the connector or puts messages to queues.
         """
@@ -616,7 +649,9 @@ class ConnectionContainer(object):
         if path == _path_ping:
             return Response()
         else:
-            msg = bunchify(loads(msg))
+            msg = msg.decode('utf8')
+            msg = loads(msg)
+            msg = bunchify(msg)
 
             # Delete what handlers don't need
             msg.pop('msg_type', None) # Optional if message was sent by a server that is starting up vs. API call
@@ -673,18 +708,45 @@ class ConnectionContainer(object):
             self.logger.warn(format_exc())
             content_type = 'text/plain'
             status = _http_503
-            data = e.message
+            data = repr(e.args)
         finally:
-            headers = [('Content-type', content_type)]
-            start_response(status, headers)
 
-            return [data]
+            try:
+                if PY2:
+                    status = status.encode('utf8')
+                    headers = [(b'Content-type', content_type.encode('utf8'))]
+                else:
+                    headers = [('Content-type', content_type)]
+
+                if not isinstance(data, bytes):
+                    data = data.encode('utf8')
+
+                start_response(status, headers)
+                return [data]
+
+            except Exception:
+                exc_formatted = format_exc()
+                self.logger.warn('Exception in finally block `%s`', exc_formatted)
 
 # ################################################################################################################################
 
     def run(self):
         server = make_server(self.host, self.port, self.on_wsgi_request)
-        server.serve_forever()
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+
+            try:
+                # Attempt to clean up, if possible
+                server.shutdown()
+                for conn in self.connections.values():
+                    conn.close()
+            except Exception:
+                # Log exception if cleanup was not possible
+                self.logger.warn('Exception in shutdown procedure `%s`', format_exc())
+            finally:
+                # Anything happens, we need to shut down the process
+                os.kill(os.getpid(), signal.SIGTERM)
 
 # ################################################################################################################################
 

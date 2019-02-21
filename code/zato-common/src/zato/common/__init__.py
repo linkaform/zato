@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -12,11 +12,11 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import os
 from collections import OrderedDict
 from copy import deepcopy
-from cStringIO import StringIO
-from httplib import responses
+from http.client import responses
+from io import StringIO
 from numbers import Number
 from string import Template
-from sys import maxint
+from sys import version_info as py_version_info
 from traceback import format_exc
 
 # boto
@@ -31,6 +31,10 @@ from candv import Constants, ValueConstant
 # lxml
 from lxml import etree
 from lxml.objectify import ObjectPath as _ObjectPath
+
+# Python 2/3 compatibility
+from past.builtins import basestring, execfile
+from zato.common.py23_ import maxint
 
 # Zato
 from zato.vault.client import VAULT
@@ -49,7 +53,9 @@ try:
     execfile(_version_py, _locals)
     version = 'Zato {}'.format(_locals['version'])
 except IOError:
-    version = '2.0.3.4'
+    version = '3.0.0'
+
+version = '{}-py{}.{}.{}'.format(version, py_version_info.major, py_version_info.minor, py_version_info.micro)
 
 # The namespace for use in all Zato's own services.
 zato_namespace = 'https://zato.io/ns/20130518'
@@ -150,7 +156,7 @@ CLI_ARG_SEP = 'ZATO_ZATO_ZATO'
 ZATO_OK = 'ZATO_OK'
 ZATO_ERROR = 'ZATO_ERROR'
 ZATO_WARNING = 'ZATO_WARNING'
-ZATO_NONE = b'ZATO_NONE'
+ZATO_NONE = 'ZATO_NONE'
 ZATO_SEC_USE_RBAC = 'ZATO_SEC_USE_RBAC'
 
 DELEGATED_TO_RBAC = 'Delegated to RBAC'
@@ -200,9 +206,8 @@ class URL_TYPE(object):
     SOAP = 'soap'
     PLAIN_HTTP = 'plain_http'
 
-    class __metaclass__(type):
-        def __iter__(self):
-            return iter((self.SOAP, self.PLAIN_HTTP))
+    def __iter__(self):
+        return iter((self.SOAP, self.PLAIN_HTTP))
 
 # Whether WS-Security passwords are transmitted in clear-text or not.
 ZATO_WSS_PASSWORD_CLEAR_TEXT = Bunch(name='clear_text', label='Clear text')
@@ -373,11 +378,10 @@ class DATA_FORMAT(Attrs):
     POST = 'post'
     SOAP = 'soap'
 
-    class __metaclass__(type):
-        def __iter__(self):
-            # Note that DICT and other attributes aren't included because they're never exposed to external world as-is,
-            # they may at most only used so that services can invoke each other directly
-            return iter((self.XML, self.JSON, self.CSV, self.POST))
+    def __iter__(self):
+        # Note that DICT and other attributes aren't included because they're never exposed to external world as-is,
+        # they may at most only used so that services can invoke each other directly
+        return iter((self.XML, self.JSON, self.CSV, self.POST))
 
 # TODO: SIMPLE_IO.FORMAT should be done away with in favour of plain DATA_FORMAT
 class SIMPLE_IO:
@@ -416,9 +420,8 @@ class CACHE:
         STR = NameId('String/unicode', 'str')
         INT = NameId('Integer', 'int')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.STR, self.INT))
+        def __iter__(self):
+            return iter((self.STR, self.INT))
 
     class STATE_CHANGED:
 
@@ -462,17 +465,15 @@ class CACHE:
         NO_PERSISTENT_STORAGE = NameId('No persistent storage', 'no-persistent-storage')
         SQL = NameId('SQL', 'sql')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.NO_PERSISTENT_STORAGE, self.SQL))
+        def __iter__(self):
+            return iter((self.NO_PERSISTENT_STORAGE, self.SQL))
 
     class SYNC_METHOD:
         NO_SYNC = NameId('No synchronization', 'no-sync')
         IN_BACKGROUND = NameId('In background', 'in-background')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.NO_SYNC, self.IN_BACKGROUND))
+        def __iter__(self):
+            return iter((self.NO_SYNC, self.IN_BACKGROUND))
 
 class KVDB(Attrs):
     SEPARATOR = ':::'
@@ -668,9 +669,8 @@ class CLOUD:
                 GLACIER = 'GLACIER'
                 DEFAULT = STANDARD
 
-                class __metaclass__(type):
-                    def __iter__(self):
-                        return iter((self.STANDARD, self.REDUCED_REDUNDANCY, self.GLACIER))
+                def __iter__(self):
+                    return iter((self.STANDARD, self.REDUCED_REDUNDANCY, self.GLACIER))
 
             class DEFAULTS:
                 ADDRESS = 'https://s3.amazonaws.com/'
@@ -693,9 +693,8 @@ class PARAMS_PRIORITY:
     MSG_OVER_CHANNEL_PARAMS = 'msg-over-channel-params'
     DEFAULT = CHANNEL_PARAMS_OVER_MSG
 
-    class __metaclass__(type):
-        def __iter__(self):
-            return iter((self.CHANNEL_PARAMS_OVER_MSG, self.MSG_OVER_CHANNEL_PARAMS, self.DEFAULT))
+    def __iter__(self):
+        return iter((self.CHANNEL_PARAMS_OVER_MSG, self.MSG_OVER_CHANNEL_PARAMS, self.DEFAULT))
 
 class NONCE_STORE:
     KEY_PATTERN = 'zato:nonce-store:{}:{}' # E.g. zato:nonce-store:oauth:27
@@ -705,18 +704,16 @@ class MSG_PATTERN_TYPE:
     JSON_POINTER = NameId('JSONPointer', 'json-pointer')
     XPATH = NameId('XPath', 'xpath')
 
-    class __metaclass__(type):
-        def __iter__(self):
-            return iter((self.JSON_POINTER, self.XPATH))
+    def __iter__(self):
+        return iter((self.JSON_POINTER, self.XPATH))
 
 class HTTP_SOAP_SERIALIZATION_TYPE:
     STRING_VALUE = NameId('String', 'string')
     SUDS = NameId('Suds', 'suds')
     DEFAULT = STRING_VALUE
 
-    class __metaclass__(type):
-        def __iter__(self):
-            return iter((self.STRING_VALUE, self.SUDS))
+    def __iter__(self):
+        return iter((self.STRING_VALUE, self.SUDS))
 
 class PUBSUB:
 
@@ -730,34 +727,31 @@ class PUBSUB:
         SOAP = NameId('SOAP', DATA_FORMAT.SOAP)
         XML  = NameId('XML', DATA_FORMAT.XML)
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.CSV, self.DICT, self.JSON, self.POST, self.SOAP, self.XML))
+        def __iter__(self):
+            return iter((self.CSV, self.DICT, self.JSON, self.POST, self.SOAP, self.XML))
 
     class HOOK_TYPE:
-        BEFORE_PUBLISH = 'before_publish'
-        BEFORE_DELIVERY = 'before_delivery'
-        ON_OUTGOING_SOAP_INVOKE = 'on_topic_outgoing_soap_invoke'
-        ON_SUBSCRIBED = 'on_subscribed'
-        ON_UNSUBSCRIBED = 'on_unsubscribed'
+        BEFORE_PUBLISH = 'pubsub_before_publish'
+        BEFORE_DELIVERY = 'pubsub_before_delivery'
+        ON_OUTGOING_SOAP_INVOKE = 'pubsub_on_topic_outgoing_soap_invoke'
+        ON_SUBSCRIBED = 'pubsub_on_subscribed'
+        ON_UNSUBSCRIBED = 'pubsub_on_unsubscribed'
 
     class HOOK_ACTION:
         SKIP = 'skip'
         DELETE = 'delete'
         DELIVER = 'deliver'
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.SKIP, self.DELETE, self.DELIVER))
+        def __iter__(self):
+            return iter((self.SKIP, self.DELETE, self.DELIVER))
 
     class DELIVER_BY:
         PRIORITY = 'priority'
         EXT_PUB_TIME = 'ext_pub_time'
         PUB_TIME = 'pub_time'
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.PRIORITY, self.EXT_PUB_TIME, self.PUB_TIME))
+        def __iter__(self):
+            return iter((self.PRIORITY, self.EXT_PUB_TIME, self.PUB_TIME))
 
     class ON_NO_SUBS_PUB:
         ACCEPT = NameId('Accept', 'accept')
@@ -782,24 +776,21 @@ class PUBSUB:
         INTERNAL_ENDPOINT_NAME = 'zato.pubsub.default.internal.endpoint'
         ON_NO_SUBS_PUB = 'accept'
         SK_OPAQUE = ('deliver_to_sk', 'reply_to_sk')
-        WSX_INTERACT_UPDATE_INTERVAL = 60 # 60 minutes = 1 hour
 
     class QUEUE_TYPE:
         STAGING = 'staging'
         CURRENT = 'current'
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.STAGING, self.CURRENT))
+        def __iter__(self):
+            return iter((self.STAGING, self.CURRENT))
 
     class GD_CHOICE:
         DEFAULT_PER_TOPIC = NameId('----------', 'default-per-topic')
         YES = NameId('Yes', 'true')
         NO = NameId('No', 'false')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.DEFAULT_PER_TOPIC, self.YES, self.NO))
+        def __iter__(self):
+            return iter((self.DEFAULT_PER_TOPIC, self.YES, self.NO))
 
     class QUEUE_ACTIVE_STATUS:
         FULLY_ENABLED = NameId('Pub and sub', 'pub-sub')
@@ -807,19 +798,17 @@ class PUBSUB:
         SUB_ONLY = NameId('Sub only', 'sub-only')
         DISABLED = NameId('Disabled', 'disabled')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.FULLY_ENABLED, self.PUB_ONLY, self.SUB_ONLY, self.DISABLED))
+        def __iter__(self):
+            return iter((self.FULLY_ENABLED, self.PUB_ONLY, self.SUB_ONLY, self.DISABLED))
 
     class DELIVERY_METHOD:
         NOTIFY = NameId('Notify', 'notify')
         PULL = NameId('Pull', 'pull')
         WEB_SOCKET = NameId('WebSocket', 'web-socket')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                # Note that WEB_SOCKET is not included because it's not shown in GUI for subscriptions
-                return iter((self.NOTIFY, self.PULL))
+        def __iter__(self):
+            # Note that WEB_SOCKET is not included because it's not shown in GUI for subscriptions
+            return iter((self.NOTIFY, self.PULL))
 
     class DELIVERY_STATUS:
         DELIVERED = 1
@@ -837,9 +826,8 @@ class PUBSUB:
         SUBSCRIBER = NameId('Subscriber', 'sub-only')
         PUBLISHER_SUBSCRIBER = NameId('Publisher/subscriber', 'pub-sub')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.PUBLISHER, self.SUBSCRIBER, self.PUBLISHER_SUBSCRIBER))
+        def __iter__(self):
+            return iter((self.PUBLISHER, self.SUBSCRIBER, self.PUBLISHER_SUBSCRIBER))
 
     class RUN_DELIVERY_STATUS:
         NO_MSG = 'no-messages'
@@ -861,9 +849,8 @@ class PUBSUB:
         SQL = NameId('SQL', 'sql')
         WEB_SOCKETS = NameId('WebSockets', 'wsx')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.AMQP, self.INTERNAL, self.REST, self.SERVICE, self.SOAP, self.WEB_SOCKETS))
+        def __iter__(self):
+            return iter((self.AMQP, self.INTERNAL, self.REST, self.SERVICE, self.SOAP, self.WEB_SOCKETS))
 
     class REDIS:
         META_TOPIC_LAST_KEY = 'zato.ps.meta.topic.last.%s.%s'
@@ -965,9 +952,8 @@ class ODOO:
         JSON_RPC = NameId('JSON-RPC', 'jsonrpc')
         JSON_RPCS = NameId('JSON-RPCS', 'jsonrpcs')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.XML_RPC, self.XML_RPCS, self.JSON_RPC, self.JSON_RPCS))
+        def __iter__(self):
+            return iter((self.XML_RPC, self.XML_RPCS, self.JSON_RPC, self.JSON_RPCS))
 
 class SAP:
     class DEFAULT:
@@ -1023,6 +1009,7 @@ class WEB_SOCKET:
         NEW_TOKEN_TIMEOUT = 5
         TOKEN_TTL = 3600
         FQDN_UNKNOWN = '(Unknown)'
+        INTERACT_UPDATE_INTERVAL = 60 # 60 minutes = 1 hour
 
     class PATTERN:
         BY_EXT_ID = 'zato.by-ext-id.{}'
@@ -1041,9 +1028,9 @@ class WEB_SOCKET:
         CLOSE = 'close'
 
     class HOOK_TYPE:
-        ON_CONNECTED = 'on_connected'
-        ON_DISCONNECTED = 'on_disconnected'
-        ON_PUBSUB_RESPONSE = 'on_pubsub_response'
+        ON_CONNECTED = 'wsx_on_connected'
+        ON_DISCONNECTED = 'wsx_on_disconnected'
+        ON_PUBSUB_RESPONSE = 'wsx_on_pubsub_response'
 
 class APISPEC:
     OPEN_API_V3 = 'openapi_v3'
@@ -1064,9 +1051,8 @@ class AMQP:
         ACK = NameId('Ack', 'ack')
         REJECT = NameId('Reject', 'reject')
 
-        class __metaclass__(type):
-            def __iter__(self):
-                return iter((self.ACK, self.REJECT))
+        def __iter__(self):
+            return iter((self.ACK, self.REJECT))
 
 class SERVER_STARTUP:
     class PHASE:
@@ -1080,20 +1066,21 @@ class SERVER_STARTUP:
         AFTER_STARTED = 'after-started'
 
 class GENERIC:
-
     ATTR_NAME = 'opaque1'
 
     class CONNECTION:
-
         class TYPE:
             OUTCONN_WSX = 'outconn-wsx'
+
+class CONFIG_FILE:
+    USER_DEFINED = 'user-defined'
 
 # Need to use such a constant because we can sometimes be interested in setting
 # default values which evaluate to boolean False.
 NO_DEFAULT_VALUE = 'NO_DEFAULT_VALUE'
 PLACEHOLDER = 'zato_placeholder'
 
-ZATO_INFO_FILE = b'.zato-info'
+ZATO_INFO_FILE = '.zato-info'
 
 class SECRETS:
 
@@ -1124,9 +1111,9 @@ class path(object):
             if self.text_only:
                 return value.text
             return value
-        except(ValueError, AttributeError), e:
+        except(ValueError, AttributeError):
             if self.raise_on_not_found:
-                raise ParsingException(None, format_exc(e))
+                raise ParsingException(None, format_exc())
             else:
                 return None
 
@@ -1197,16 +1184,19 @@ class Inactive(ZatoException):
     def __init__(self, name):
         super(Inactive, self).__init__(None, '`{}` is inactive'.format(name))
 
-class SourceInfo(object):
+class SourceCodeInfo(object):
     """ A bunch of attributes dealing the service's source code.
     """
+    __slots__ = 'source', 'source_html', 'len_source', 'path', 'hash', 'hash_method', 'server_name'
+
     def __init__(self):
-        self.source = None
-        self.source_html = None
-        self.path = None
-        self.hash = None
-        self.hash_method = None
-        self.server_name = None
+        self.source = ''        # type: text
+        self.source_html = ''   # type: text
+        self.len_source = 0     # type: int
+        self.path = None        # type: text
+        self.hash = None        # type: text
+        self.hash_method = None # type: text
+        self.server_name = None # type: text
 
 class StatsElem(object):
     """ A single element of a statistics query result concerning a particular service.
@@ -1366,8 +1356,9 @@ default_internal_modules = {
     'zato.server.service.internal.cache.memcached': True,
     'zato.server.service.internal.channel.amqp_': True,
     'zato.server.service.internal.channel.jms_wmq': True,
-    'zato.server.service.internal.channel.stomp': True,
+    'zato.server.service.internal.channel.stomp': False,
     'zato.server.service.internal.channel.web_socket': True,
+    'zato.server.service.internal.channel.web_socket.cleanup': True,
     'zato.server.service.internal.channel.web_socket.client': True,
     'zato.server.service.internal.channel.web_socket.subscription': True,
     'zato.server.service.internal.channel.zmq': True,
@@ -1409,7 +1400,6 @@ default_internal_modules = {
     'zato.server.service.internal.pickup': True,
     'zato.server.service.internal.pattern.invoke_retry': True,
     'zato.server.service.internal.pubsub': True,
-    'zato.server.service.internal.pubsub.cleanup': True,
     'zato.server.service.internal.pubsub.delivery': True,
     'zato.server.service.internal.pubsub.endpoint': True,
     'zato.server.service.internal.pubsub.hook': True,
@@ -1420,6 +1410,7 @@ default_internal_modules = {
     'zato.server.service.internal.pubsub.subscription': True,
     'zato.server.service.internal.pubsub.queue': True,
     'zato.server.service.internal.pubsub.task': True,
+    'zato.server.service.internal.pubsub.task.main': True,
     'zato.server.service.internal.pubsub.task.delivery_server': True,
     'zato.server.service.internal.pubsub.topic': True,
     'zato.server.service.internal.query.cassandra': True,

@@ -1,7 +1,7 @@
 # -# -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -25,6 +25,7 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'email_smtp'
 model = SMTP
 label = 'an SMTP connection'
+get_list_docs = 'SMTP connections'
 broker_message = EMAIL
 broker_message_prefix = 'SMTP_'
 list_func = email_smtp_list
@@ -76,7 +77,8 @@ class ChangePassword(ChangePasswordBase):
 # ################################################################################################################################
 
 class Ping(AdminService):
-
+    """ Pings an SMTP connection to check its configuration.
+    """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_email_smtp_ping_request'
         response_elem = 'zato_email_smtp_ping_response'

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -14,22 +14,15 @@ from traceback import format_exc
 # rapidjson
 from rapidjson import dumps
 
+# Python 2/3 compatibility
+from future.utils import itervalues
+
 # Zato
 from zato.common import CHANNEL, CONTENT_TYPE, PUBSUB
 from zato.common.exception import BadRequest, Forbidden, PubSubSubscriptionExists
+from zato.common.util.auth import parse_basic_auth
 from zato.server.service import AsIs, Int, Service
 from zato.server.service.internal.pubsub.subscription import CreateWSXSubscription
-
-# ################################################################################################################################
-
-def parse_basic_auth(auth, prefix = 'Basic '):
-    if not auth.startswith(prefix):
-        raise ValueError('Missing Basic Auth prefix')
-
-    _, auth = auth.split(prefix)
-    auth = auth.strip().decode('base64')
-
-    return auth.split(':', 1)
 
 # ################################################################################################################################
 
@@ -55,7 +48,7 @@ class SubSIO(BaseSIO):
 
 # ################################################################################################################################
 
-class PubSubService(Service):
+class _PubSubService(Service):
 
     def _pubsub_check_credentials(self, _invoke_channels=(CHANNEL.INVOKE, CHANNEL.INVOKE_ASYNC)):
 
@@ -74,7 +67,7 @@ class PubSubService(Service):
         except ValueError:
             raise Forbidden(self.cid)
 
-        basic_auth = self.server.worker_store.request_dispatcher.url_data.basic_auth_config.itervalues()
+        basic_auth = itervalues(self.server.worker_store.request_dispatcher.url_data.basic_auth_config)
 
         for item in basic_auth:
             config = item['config']
@@ -100,7 +93,7 @@ class PubSubService(Service):
 
 # ################################################################################################################################
 
-class TopicService(PubSubService):
+class TopicService(_PubSubService):
     """ Main service responsible for publications to and deliveries from a given topic. Handles security and distribution
     of messages to target queues or recipients.
     """
@@ -166,7 +159,7 @@ class TopicService(PubSubService):
 
 # ################################################################################################################################
 
-class SubscribeService(PubSubService):
+class SubscribeService(_PubSubService):
     """ Service through which REST clients subscribe to or unsubscribe from topics.
     """
     SimpleIO = SubSIO
@@ -258,6 +251,8 @@ class SubscribeService(PubSubService):
 # ################################################################################################################################
 
 class PublishMessage(Service):
+    """ Lets one publish messages to a topic.
+    """
     SimpleIO = TopicSIO
 
     def handle(self):
@@ -267,6 +262,8 @@ class PublishMessage(Service):
 # ################################################################################################################################
 
 class GetMessages(Service):
+    """ Used to return outstanding messages from a topic.
+    """
     SimpleIO = TopicSIO
 
     def handle(self):
@@ -276,6 +273,8 @@ class GetMessages(Service):
 # ################################################################################################################################
 
 class Subscribe(Service):
+    """ Lets callers subscribe to topics.
+    """
     SimpleIO = SubSIO
 
     def handle(self):
@@ -286,11 +285,15 @@ class Subscribe(Service):
 
 # Added for completness so as to make WSX clients use services from this module only
 class SubscribeWSX(CreateWSXSubscription):
+    """ An alias to CreateWSXSubscription, added for API completeness.
+    """
     name = 'zato.pubsub.pubapi.subscribe-wsx'
 
 # ################################################################################################################################
 
 class Unsubscribe(Service):
+    """ Lets one unsubscribe from a topic.
+    """
     SimpleIO = SubSIO
 
     def handle(self):

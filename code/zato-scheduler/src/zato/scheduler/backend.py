@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -23,16 +23,20 @@ from gevent import lock, sleep
 # paodate
 from paodate import Delta
 
-# Paste
-from paste.util.converters import asbool
+# Python 2/3 compatibility
+from future.utils import itervalues
 
 # Zato
 from zato.common import SCHEDULER
-from zato.common.util import add_scheduler_jobs, add_startup_jobs, make_repr, new_cid, spawn_greenlet
+from zato.common.util import add_scheduler_jobs, add_startup_jobs, asbool, make_repr, new_cid, spawn_greenlet
 
 # ################################################################################################################################
 
 logger = getLogger(__name__)
+
+# ################################################################################################################################
+
+initial_sleep = 30
 
 # ################################################################################################################################
 
@@ -100,6 +104,9 @@ class Job(object):
 
     def __eq__(self, other):
         return self.name == other.name
+
+    def __lt__(self, other):
+        return self.name < other.name
 
     def clone(self, name=None, is_active=None):
 
@@ -235,8 +242,8 @@ class Job(object):
                     # Invoke callback in a new greenlet so it doesn't block the current one.
                     self._spawn(self.callback, **{'ctx':self.get_context()})
 
-                except Exception, e:
-                    logger.warn(format_exc(e))
+                except Exception:
+                    logger.warn(format_exc())
 
                 finally:
                     # Pause the greenlet for however long is needed if it is not a one-off job
@@ -247,8 +254,8 @@ class Job(object):
 
             logger.info('Job leaving main loop `%s` after %d iterations', self, self.current_run)
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
         return True
 
@@ -279,8 +286,8 @@ class Job(object):
 
             self.main_loop()
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
 # ################################################################################################################################
 
@@ -319,8 +326,8 @@ class Scheduler(object):
 
             else:
                 logger.debug('Skipping inactive job `%s`', job)
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
     def create(self, *args, **kwargs):
         with self.lock:
@@ -374,7 +381,7 @@ class Scheduler(object):
         _job = None
 
         with self.lock:
-            for job in self.jobs.itervalues():
+            for job in itervalues(self.jobs):
                 if job.name == name:
                     _job = job
                     break
@@ -406,12 +413,12 @@ class Scheduler(object):
         """ Executes a job no matter if it's active or not. One-time job are not unscheduled afterwards.
         """
         with self.lock:
-            for job in self.jobs.itervalues():
+            for job in itervalues(self.jobs):
                 if job.name == name:
                     self.on_job_executed(job.get_context(), False)
                     break
             else:
-                logger.warn('No such job `%s` in `%s`', name, [elem.get_context() for elem in self.jobs.itervalues()])
+                logger.warn('No such job `%s` in `%s`', name, [elem.get_context() for elem in itervalues(self.jobs)])
 
     def on_job_executed(self, ctx, unschedule_one_time=True):
         logger.debug('Executing `%s`, `%s`', ctx['name'], ctx)
@@ -433,28 +440,29 @@ class Scheduler(object):
         job.on_max_repeats_reached_cb = self.on_max_repeats_reached
         self.job_greenlets[job.name] = self._spawn(job.run)
 
-    def add_startup_jobs(self):
-        sleep(40) # To make sure that at least one server is running if the environment was started from quickstart scripts
+    def init_jobs(self):
+        sleep(initial_sleep) # To make sure that at least one server is running if the environment was started from quickstart scripts
         cluster_conf = self.config.main.cluster
         add_startup_jobs(cluster_conf.id, self.odb, self.startup_jobs, asbool(cluster_conf.stats_enabled))
+
+        # Actually start jobs now, including any added above
+        if self._add_scheduler_jobs:
+            add_scheduler_jobs(self.api, self.odb, self.config.main.cluster.id, spawn=False)
 
     def run(self):
 
         try:
 
-            # Add the statistics-related scheduler jobs to the ODB
-            if self._add_startup_jobs:
-                spawn_greenlet(self.add_startup_jobs)
+            logger.info('Scheduler will start to execute jobs in %d seconds', initial_sleep)
 
-            # All other jobs
-            if self._add_scheduler_jobs:
-                add_scheduler_jobs(self.api, self.odb, self.config.main.cluster.id, spawn=False)
+            # Add default jobs to the ODB and start all of them, the default and user-defined ones
+            self.init_jobs()
 
             _sleep = self.sleep
             _sleep_time = self.sleep_time
 
             with self.lock:
-                for job in sorted(self.jobs.itervalues()):
+                for job in sorted(itervalues(self.jobs)):
                     if job.max_repeats_reached:
                         logger.info('Job `%s` already reached max runs count (%s UTC)', job.name, job.max_repeats_reached_at)
                     else:
@@ -471,5 +479,5 @@ class Scheduler(object):
                 if self.iter_cb:
                     self.iter_cb(*self.iter_cb_args)
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())

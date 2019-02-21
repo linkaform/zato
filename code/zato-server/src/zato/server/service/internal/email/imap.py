@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -11,6 +11,9 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # stdlib
 from contextlib import closing
 from time import time
+
+# Python 2/3 compatibility
+from six import add_metaclass
 
 # Zato
 from zato.common.broker_message import EMAIL
@@ -24,6 +27,7 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'email_imap'
 model = IMAP
 label = 'an IMAP connection'
+get_list_docs = 'IMAP connections'
 broker_message = EMAIL
 broker_message_prefix = 'IMAP_'
 list_func = email_imap_list
@@ -36,24 +40,27 @@ def instance_hook(service, input, instance, attrs):
 
 # ################################################################################################################################
 
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = IMAP.name,
-    __metaclass__ = GetListMeta
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
 
 # ################################################################################################################################
 
@@ -75,7 +82,8 @@ class ChangePassword(ChangePasswordBase):
 # ################################################################################################################################
 
 class Ping(AdminService):
-
+    """ Pings an IMAP connection to check its configuration.
+    """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_email_imap_ping_request'
         response_elem = 'zato_email_imap_ping_response'

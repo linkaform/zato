@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -9,9 +9,10 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import logging, os, signal
-from datetime import datetime
-from logging import INFO
+import logging
+import os
+from datetime import datetime, timedelta
+from logging import INFO, WARN
 from re import IGNORECASE
 from tempfile import mkstemp
 from traceback import format_exc
@@ -21,7 +22,6 @@ from uuid import uuid4
 from anyjson import dumps
 
 # gevent
-import gevent
 import gevent.monkey # Needed for Cassandra
 
 # globre
@@ -32,9 +32,6 @@ from numpy.random import seed as numpy_seed
 
 # Paste
 from paste.util.converters import asbool
-
-# Spring Python
-from springpython.context import DisposableObject
 
 # Zato
 from zato.broker import BrokerMessageReceiver
@@ -50,7 +47,7 @@ from zato.common.pubsub import SkipDelivery
 from zato.common.util import absolutize, get_config, get_kvdb_config_for_log, get_user_config_name, hot_deploy, \
      invoke_startup_services as _invoke_startup_services, new_cid, spawn_greenlet, StaticConfig, \
      register_diag_handlers
-from zato.common.util.posix_ipc_ import ServerStartupIPC
+from zato.common.util.posix_ipc_ import ConnectorConfigIPC, ServerStartupIPC
 from zato.common.util.time_ import TimeUtil
 from zato.distlock import LockManager
 from zato.server.base.worker import WorkerStore
@@ -70,7 +67,7 @@ megabyte = 10**6
 
 # ################################################################################################################################
 
-class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
+class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
     """ Main server process.
     """
     def __init__(self):
@@ -115,7 +112,6 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self.deployment_lock_expires = None
         self.deployment_lock_timeout = None
         self.deployment_key = ''
-        self.app_context = None
         self.has_gevent = None
         self.delivery_store = None
         self.static_config = None
@@ -137,6 +133,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self.is_first_worker = None
         self.shmem_size = -1.0
         self.server_startup_ipc = ServerStartupIPC()
+        self.connector_config_ipc = ConnectorConfigIPC()
         self.keyutils = KeyUtils()
         self.sso_api = None
         self.is_sso_enabled = False
@@ -147,6 +144,10 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self._hash_secret_rounds = None
         self._hash_secret_salt_size = None
 
+        # Our arbiter may potentially call the cleanup procedure multiple times
+        # and this will be set to True the first time around.
+        self._is_process_closing = False
+
         # Allows users store arbitrary data across service invocations
         self.user_ctx = Bunch()
         self.user_ctx_lock = gevent.lock.RLock()
@@ -154,13 +155,11 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self.access_logger = logging.getLogger('zato_access_log')
         self.access_logger_log = self.access_logger._log
         self.needs_access_log = self.access_logger.isEnabledFor(INFO)
-        self.has_pubsub_audit_log = logging.getLogger('zato_pubsub_audit').isEnabledFor('INFO')
-        self.is_enabled_for_warn = logging.getLogger('zato').isEnabledFor('WARN')
+        self.has_pubsub_audit_log = logging.getLogger('zato_pubsub_audit').isEnabledFor(INFO)
+        self.is_enabled_for_warn = logging.getLogger('zato').isEnabledFor(WARN)
 
         # The main config store
         self.config = ConfigStore()
-
-        gevent.signal(signal.SIGINT, self.destroy)
 
 # ################################################################################################################################
 
@@ -229,7 +228,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
 
     def maybe_on_first_worker(self, server, redis_conn):
         """ This method will execute code with a distibuted lock held. We need a lock because we can have multiple worker
-        processes fighting over the right to redeploy services. The first worker to grab the lock will actually perform
+        processes fighting over the right to redeploy services. The first worker to obtain the lock will actually perform
         the redeployment and set a flag meaning that for this particular deployment key (and remember that each server restart
         means a new deployment key) the services have been already deployed. Further workers will check that the flag exists
         and will skip the deployment altogether.
@@ -245,6 +244,14 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
             # This was added between 3.0 and 3.1, which is why it is optional
             deploy_internal = self.fs_server_config.get('deploy_internal', default_internal_modules)
 
+            # Above, we potentially got the list of internal modules to be deployed as they were defined in server.conf.
+            # However, if someone creates an environment and then we add a new module, this module will not neccessarily
+            # exist in server.conf. This is why we need to add any such missing ones explicitly below.
+            for internal_module, is_enabled in default_internal_modules.items():
+                if internal_module not in deploy_internal:
+                    deploy_internal[internal_module] = is_enabled
+
+            # All internal modules were found, now we can build a list of what is to be enabled.
             for module_name, is_enabled in deploy_internal.items():
                 if is_enabled:
                     internal_service_modules.append(module_name)
@@ -252,8 +259,17 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
             locally_deployed.extend(self.service_store.import_internal_services(
                 internal_service_modules, self.base_dir, self.sync_internal, is_first))
 
-            locally_deployed.extend(self.service_store.import_services_from_anywhere(
-                self.service_modules + self.service_sources, self.base_dir))
+            logger.info('Deploying user-defined services (%s)', self.name)
+
+            user_defined_deployed = self.service_store.import_services_from_anywhere(
+                self.service_modules + self.service_sources, self.base_dir).to_process
+
+            locally_deployed.extend(user_defined_deployed)
+            len_user_defined_deployed = len(user_defined_deployed)
+
+            suffix = ' ' if len_user_defined_deployed == 1 else 's '
+
+            logger.info('Deployed %d user-defined service%s (%s)', len_user_defined_deployed, suffix, self.name)
 
             return set(locally_deployed)
 
@@ -267,7 +283,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
             if redis_conn.get(already_deployed_flag):
                 # There has been already the first worker who's done everything there is to be done so we may just return.
                 is_first = False
-                logger.debug('Not attempting to grab the lock_name:`%s`', lock_name)
+                logger.debug('Not attempting to obtain the lock_name:`%s`', lock_name)
 
                 # Simply deploy services, including any missing ones, the first worker has already cleared out the ODB
                 locally_deployed = import_initial_services_jobs(is_first)
@@ -338,6 +354,8 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         for name in open(os.path.join(self.repo_location, self.fs_server_config.main.service_sources)):
             name = name.strip()
             if name and not name.startswith('#'):
+                if not os.path.isabs(name):
+                    name = os.path.normpath(os.path.join(self.base_dir, name))
                 self.service_sources.append(name)
 
         # User-config from ./config/repo/user-config
@@ -393,7 +411,9 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
 
         # Create all POSIX IPC objects now that we have the deployment key
         self.shmem_size = int(float(self.fs_server_config.shmem.size) * 10**6) # Convert to megabytes as integer
+
         self.server_startup_ipc.create(self.deployment_key, self.shmem_size)
+        self.connector_config_ipc.create(self.deployment_key, self.shmem_size)
 
         # Store the ODB configuration, create an ODB connection pool and have self.odb use it
         self.config.odb_data = self.get_config_odb_data(self)
@@ -437,13 +457,6 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self.worker_store.target_matcher.read_config(self.fs_server_config.invoke_target_patterns_allowed)
         self.set_up_config(server)
 
-        # Deploys services
-        is_first, locally_deployed = self._after_init_common(server)
-
-        # Initializes worker store, including connectors
-        self.worker_store.init()
-        self.request_dispatcher_dispatch = self.worker_store.request_dispatcher.dispatch
-
         # Normalize hot-deploy configuration
         self.hot_deploy_config = Bunch()
 
@@ -453,6 +466,22 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self.hot_deploy_config.backup_history = int(self.fs_server_config.hot_deploy.backup_history)
         self.hot_deploy_config.backup_format = self.fs_server_config.hot_deploy.backup_format
 
+        # Added in 3.1, hence optional
+        max_batch_size = int(self.fs_server_config.hot_deploy.get('max_batch_size', 1000))
+
+        # Turn it into megabytes
+        max_batch_size = max_batch_size * 1000
+
+        # Finally, assign it to ServiceStore
+        self.service_store.max_batch_size = max_batch_size
+
+        # Deploys services
+        is_first, locally_deployed = self._after_init_common(server)
+
+        # Initializes worker store, including connectors
+        self.worker_store.init()
+        self.request_dispatcher_dispatch = self.worker_store.request_dispatcher.dispatch
+
         # Configure remaining parts of SSO
         self.configure_sso()
 
@@ -460,11 +489,20 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         salt_size = self.sso_config.hash_secret.salt_size
         self.crypto_manager.add_hash_scheme('zato.default', self.sso_config.hash_secret.rounds, salt_size)
 
-        for name in('current_work_dir', 'backup_work_dir', 'last_backup_work_dir', 'delete_after_pick_up'):
+        for name in('current_work_dir', 'backup_work_dir', 'last_backup_work_dir', 'delete_after_pickup'):
 
             # New in 2.0
-            if name == 'delete_after_pick_up':
-                value = asbool(self.fs_server_config.hot_deploy.get(name, True))
+            if name == 'delete_after_pickup':
+
+                # For backward compatibility, we need to support both names
+                old_name = 'delete_after_pick_up'
+
+                if old_name in self.fs_server_config.hot_deploy:
+                    _name = old_name
+                else:
+                    _name = name
+
+                value = asbool(self.fs_server_config.hot_deploy.get(_name, True))
                 self.hot_deploy_config[name] = value
             else:
                 self.hot_deploy_config[name] = os.path.normpath(os.path.join(
@@ -478,10 +516,29 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         self.broker_client = BrokerClient(self.kvdb, 'parallel', broker_callbacks, self.get_lua_programs())
         self.worker_store.set_broker_client(self.broker_client)
 
-        self._after_init_accepted(locally_deployed)
+        # Make sure that broker client's connection is ready before continuing
+        # to rule out edge cases where, for instance, hot deployment would
+        # try to publish a locally found package (one of extra packages found)
+        # before the client's thread connected to KVDB.
+        if not self.broker_client.ready:
+            start = now = datetime.utcnow()
+            max_seconds = 120
+            until = now + timedelta(seconds=max_seconds)
 
-        self.odb.server_up_down(server.token, SERVER_UP_STATUS.RUNNING, True, self.host,
-                                self.port, self.preferred_address, use_tls)
+            while not self.broker_client.ready:
+                now = datetime.utcnow()
+                delta = (now - start).total_seconds()
+                if now < until:
+                    # Do not log too early so as not to clutter logs
+                    if delta > 2:
+                        logger.info('Waiting for broker client to become ready (%s, max:%s)', delta, max_seconds)
+                    gevent.sleep(0.5)
+                else:
+                    raise Exception('Broker client did not become ready within {} seconds'.format(max_seconds))
+
+        self._after_init_accepted(locally_deployed)
+        self.odb.server_up_down(
+            server.token, SERVER_UP_STATUS.RUNNING, True, self.host, self.port, self.preferred_address, use_tls)
 
         if is_first:
 
@@ -490,6 +547,11 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
             self.startup_callable_tool.invoke(SERVER_STARTUP.PHASE.IN_PROCESS_FIRST, kwargs={
                 'parallel_server': self,
             })
+
+            # Clean up any old WSX connections possibly registered for this server
+            # which may be still linger around, for instance, if the server was previously
+            # shut down forcibly and did not have an opportunity to run self.cleanup_on_stop
+            self.cleanup_wsx()
 
             # Startup services
             self.invoke_startup_services(is_first)
@@ -501,10 +563,14 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
                 # Will block for a few seconds at most, until is_ok is returned
                 # which indicates that a connector started or not.
                 is_ok = self.start_ibm_mq_connector(int(self.fs_server_config.ibm_mq.ipc_tcp_start_port))
-                if is_ok:
-                    self.create_initial_wmq_definitions(self.worker_store.worker_config.definition_wmq)
-                    self.create_initial_wmq_outconns(self.worker_store.worker_config.out_wmq)
-                    self.create_initial_wmq_channels(self.worker_store.worker_config.channel_wmq)
+
+                try:
+                    if is_ok:
+                        self.create_initial_wmq_definitions(self.worker_store.worker_config.definition_wmq)
+                        self.create_initial_wmq_outconns(self.worker_store.worker_config.out_wmq)
+                        self.create_initial_wmq_channels(self.worker_store.worker_config.channel_wmq)
+                except Exception as e:
+                    logger.warn('Could not create initial IBM MQ objects, e:`%s`', e)
 
         else:
             self.startup_callable_tool.invoke(SERVER_STARTUP.PHASE.IN_PROCESS_OTHER, kwargs={
@@ -553,7 +619,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
 
     def invoke_startup_services(self, is_first):
         _invoke_startup_services('Parallel', 'startup_services_first_worker' if is_first else 'startup_services_any_worker',
-                                 self.fs_server_config, self.repo_location, self.broker_client, 'zato.notif.init-notifiers',
+            self.fs_server_config, self.repo_location, self.broker_client, 'zato.notif.init-notifiers',
             is_sso_enabled=self.is_sso_enabled)
 
 # ################################################################################################################################
@@ -572,7 +638,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
 
             stanza_config.read_on_pickup = asbool(stanza_config.get('read_on_pickup', True))
             stanza_config.parse_on_pickup = asbool(stanza_config.get('parse_on_pickup', True))
-            stanza_config.delete_after_pick_up = asbool(stanza_config.get('delete_after_pick_up', True))
+            stanza_config.delete_after_pickup = asbool(stanza_config.get('delete_after_pickup', True))
             stanza_config.case_insensitive = asbool(stanza_config.get('case_insensitive', True))
             stanza_config.pickup_from = absolutize(stanza_config.pickup_from, self.base_dir)
             stanza_config.is_service_hot_deploy = False
@@ -610,7 +676,7 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
             'patterns': [globre.compile('*.py', globre.EXACT | IGNORECASE)],
             'read_on_pickup': False,
             'parse_on_pickup': False,
-            'delete_after_pick_up': self.hot_deploy_config.delete_after_pick_up,
+            'delete_after_pickup': self.hot_deploy_config.delete_after_pickup,
             'is_service_hot_deploy': True,
         })
 
@@ -755,7 +821,10 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
     def encrypt(self, data, _prefix=SECRETS.PREFIX):
         """ Returns data encrypted using server's CryptoManager.
         """
-        return '{}{}'.format(_prefix, self.crypto_manager.encrypt(data.encode('utf8')))
+        data = data.encode('utf8')
+        encrypted = self.crypto_manager.encrypt(data)
+        encrypted = encrypted.decode('utf8')
+        return '{}{}'.format(_prefix, encrypted)
 
 # ################################################################################################################################
 
@@ -806,21 +875,34 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
     @staticmethod
     def worker_exit(arbiter, worker):
 
-        # Clean up IBM MQ configuration
-        if worker.app.zato_wsgi_app.pid:
-            worker.app.zato_wsgi_app.keyutils.user_delete(b'zato-wmq', worker.app.zato_wsgi_app.pid)
+        # Invoke cleanup procedures
+        worker.app.zato_wsgi_app.cleanup_on_stop()
 
 # ################################################################################################################################
 
-    def destroy(self):
-        """ A Spring Python hook for closing down all the resources held.
+    def cleanup_wsx(self, needs_pid=False):
+        """ Delete persistent information about WSX clients currently registered with the server.
         """
+        wsx_service = 'zato.channel.web-socket.client.delete-by-server'
+
+        if self.service_store.is_deployed(wsx_service):
+            self.invoke(wsx_service, {'needs_pid': needs_pid})
+
+# ################################################################################################################################
+
+    @staticmethod
+    def cleanup_worker(worker):
+        worker.app.cleanup_on_stop()
+
+    def cleanup_on_stop(self):
+        """ A shutdown cleanup procedure.
+        """
+
         # Tell the ODB we've gone through a clean shutdown but only if this is
         # the main process going down (Arbiter) not one of Gunicorn workers.
         # We know it's the main process because its ODB's session has never
         # been initialized.
         if not self.odb.session_initialized:
-
 
             self.config.odb_data = self.get_config_odb_data(self)
             self.config.odb_data['fs_sql_config'] = self.fs_sql_config
@@ -834,19 +916,26 @@ class ParallelServer(DisposableObject, BrokerMessageReceiver, ConfigLoader, HTTP
         # Per-worker cleanup
         else:
 
+            # Set the flag to True only the first time we are called, otherwise simply return
+            if self._is_process_closing:
+                return
+            else:
+                self._is_process_closing = True
+
+            # Close SQL pools
+            self.sql_pool_store.cleanup_on_stop()
+
             # Close all POSIX IPC structures
             self.server_startup_ipc.close()
+            self.connector_config_ipc.close()
 
             # Close ZeroMQ-based IPC
             self.ipc_api.close()
 
-            # Delete persistent information about all clients currently connected
-            wsx_service = 'zato.channel.web-socket.client.delete-by-server'
-            if self.service_store.is_deployed(wsx_service):
-                self.invoke(wsx_service)
+            # WSX connections for this server cleanup
+            self.cleanup_wsx(True)
 
-    # Convenience API
-    stop = destroy
+            logger.info('Stopping server process (%s:%s) (%s)', self.name, self.pid, os.getpid())
 
 # ################################################################################################################################
 

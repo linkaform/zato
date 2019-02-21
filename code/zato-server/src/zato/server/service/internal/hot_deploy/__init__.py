@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -19,6 +19,9 @@ from traceback import format_exc
 # anyjson
 from anyjson import dumps
 
+# Python 2/3 compatibility
+from builtins import bytes
+
 # Zato
 from zato.common import DEPLOYMENT_STATUS, KVDB
 from zato.common.broker_message import HOT_DEPLOY
@@ -31,9 +34,7 @@ MAX_BACKUPS = 1000
 _first_prefix = '0' * (len(str(MAX_BACKUPS)) - 1) # So it runs from, e.g.,  000 to 999
 
 class Create(AdminService):
-    """ Creates all the needed filesystem directories and files out of a deployment
-    package stored in the ODB and starts all the services contained within the
-    package.
+    """ Creates all the filesystem directories and files out of a deployment package stored in the ODB.
     """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_hot_deploy_create_request'
@@ -121,16 +122,17 @@ class Create(AdminService):
         self._backup_linear_log(fs_now, current_work_dir, backup_format, backup_work_dir, backup_history)
 
     def _deploy_file(self, current_work_dir, payload, file_name):
+
         f = open(file_name, 'w')
-        f.write(payload)
+        f.write(payload.decode('utf8') if isinstance(payload, bytes) else payload)
         f.close()
 
         services_deployed = []
+        info = self.server.service_store.import_services_from_anywhere(file_name, current_work_dir)
 
-        for service in self.server.service_store.import_services_from_file(file_name, False, current_work_dir):
+        for service in info.to_process:
 
-            impl_name = self.server.service_store.name_to_impl_name[service.get_name()]
-            service_id = self.server.service_store.impl_name_to_id[impl_name]
+            service_id = self.server.service_store.impl_name_to_id[service.impl_name]
             services_deployed.append(service_id)
 
             msg = {}
@@ -220,8 +222,8 @@ class Create(AdminService):
                     # .. all workers get here.
                     self.response.payload.services_deployed = self.deploy_package(self.request.input.package_id, session)
 
-                except(IOError, OSError), e:
+                except(IOError, OSError) as e:
                     if e.errno == ENOENT:
-                        self.logger.debug('Caught ENOENT e:`%s`', format_exc(e))
+                        self.logger.debug('Caught ENOENT e:`%s`', format_exc())
                     else:
                         raise

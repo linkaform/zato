@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -205,7 +205,7 @@ class _Get(AdminService):
 # ################################################################################################################################
 
 class GetList(_Get):
-    """ Returns a list of all jobs defined in the SingletonServer's scheduler.
+    """ Returns a list of all jobs defined in the scheduler.
     """
     _filter_by = Job.name,
     name = _service_name_prefix + 'get-list'

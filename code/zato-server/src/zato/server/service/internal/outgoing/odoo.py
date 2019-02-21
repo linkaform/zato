@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
 
 from __future__ import absolute_import, division, print_function, unicode_literals
+
+# Python 2/3 compatibility
+from six import add_metaclass
 
 # stdlib
 from contextlib import closing
@@ -26,6 +29,7 @@ from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 elem = 'email_imap'
 model = OutgoingOdoo
 label = 'an Odoo connection'
+get_list_docs = 'Odoo connections'
 broker_message = OUTGOING
 broker_message_prefix = 'ODOO_'
 list_func = out_odoo_list
@@ -45,24 +49,27 @@ def broker_message_hook(service, input, instance, attrs, service_type):
 
 # ################################################################################################################################
 
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = OutgoingOdoo.name,
-    __metaclass__ = GetListMeta
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
 # ################################################################################################################################
 
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
 
 # ################################################################################################################################
 
@@ -85,7 +92,8 @@ class ChangePassword(ChangePasswordBase):
 # ################################################################################################################################
 
 class Ping(AdminService):
-
+    """ Pings an Odoo connection to check its configuration.
+    """
     class SimpleIO(AdminSIO):
         request_elem = 'zato_outgoing_odoo_ping_request'
         response_elem = 'zato_outgoing_odoo_ping_response'

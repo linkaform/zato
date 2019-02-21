@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -12,15 +12,15 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import inspect
 import logging
 import os
+from contextlib import closing
 from datetime import datetime
+from functools import total_ordering
 from hashlib import sha256
 from importlib import import_module
 from inspect import isclass
-from json import dumps
+from pickle import HIGHEST_PROTOCOL as highest_pickle_protocol
 from traceback import format_exc
-
-# Bunch
-from bunch import bunchify
+from typing import Any, List
 
 # dill
 from dill import dumps as dill_dumps, load as dill_load
@@ -28,24 +28,29 @@ from dill import dumps as dill_dumps, load as dill_load
 # gevent
 from gevent.lock import RLock
 
+# humanize
+from humanize import naturalsize
+
 # PyYAML
 try:
-    from yaml import CDumper  # Looks awkward but it's to make import checkers happy
+    from yaml import CDumper  # For pyflakes
     Dumper = CDumper
 except ImportError:
     from yaml import Dumper   # ditto
     Dumper = Dumper
 
-# Spring Python
-from springpython.context import InitializingObject
-
 # Zato
-from zato.common import DONT_DEPLOY_ATTR_NAME, KVDB, SourceInfo, TRACE1
+from zato.common import DONT_DEPLOY_ATTR_NAME, KVDB, SourceCodeInfo, TRACE1
 from zato.common.match import Matcher
 from zato.common.odb.model.base import Base as ModelBase
 from zato.common.util import deployment_info, import_module_from_path, is_func_overridden, is_python_file, visit_py_source
+from zato.common.util.json_ import dumps
 from zato.server.service import after_handle_hooks, after_job_hooks, before_handle_hooks, before_job_hooks, PubSubHook, Service
 from zato.server.service.internal import AdminService
+
+# For pyflakes
+Any = Any
+List = List
 
 # ################################################################################################################################
 
@@ -55,7 +60,65 @@ has_trace1 = logger.isEnabledFor(TRACE1)
 
 # ################################################################################################################################
 
+_unsupported_pickle_protocol_msg = 'unsupported pickle protocol:'
+
+# ################################################################################################################################
+
 hook_methods = ('accept', 'get_request_hash') + before_handle_hooks + after_handle_hooks + before_job_hooks + after_job_hooks
+
+# ################################################################################################################################
+
+@total_ordering
+class InRAMService(object):
+    __slots__ = 'cluster_id', 'id', 'name', 'impl_name', 'deployment_info', 'service_class', 'is_active', 'is_internal', \
+        'slow_threshold', 'source_code_info'
+
+    def __init__(self):
+        self.cluster_id = None       # type: int
+        self.id = None               # type: int
+        self.impl_name = None        # type: text
+        self.name = None             # type: text
+        self.deployment_info = None  # type: text
+        self.service_class = None    # type: object
+        self.is_active = None        # type: bool
+        self.is_internal = None      # type: bool
+        self.slow_threshold = None   # type: int
+        self.source_code_info = None # type: SourceCodeInfo
+
+    def __repr__(self):
+        return '<{} at {} name:{} impl_name:{}>'.format(self.__class__.__name__, hex(id(self)), self.name, self.impl_name)
+
+    def __eq__(self, other):
+        # type: (InRAMService) -> bool
+        return self.name == other.name
+
+    def __lt__(self, other):
+        # type: (InRAMService) -> bool
+        return self.name < other.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def to_dict(self):
+        return {
+            'name': self.name,
+            'impl_name': self.impl_name,
+            'is_active': self.is_active,
+            'is_internal': self.is_internal,
+            'cluster_id': self.cluster_id
+        }
+
+# ################################################################################################################################
+
+class DeploymentInfo(object):
+    __slots__ = 'to_process', 'total_services', 'total_size', 'total_size_human'
+
+    def __init__(self):
+        self.to_process = []      # type: List
+        self.total_size = 0       # type: int
+        self.total_size_human = 0 # type: text
+
+# ################################################################################################################################
 
 def set_up_class_attributes(class_, service_store=None, name=None):
     class_.add_http_method_handlers()
@@ -87,7 +150,7 @@ def set_up_class_attributes(class_, service_store=None, name=None):
         class_.cloud.aws.s3 = service_store.server.worker_store.worker_config.cloud_aws_s3
         class_._out_ftp = service_store.server.worker_store.worker_config.out_ftp
         class_._out_plain_http = service_store.server.worker_store.worker_config.out_plain_http
-        class_.amqp.invoke = class_.amqp.send = service_store.server.worker_store.amqp_invoke # .send is for pre-3.0 backward compat
+        class_.amqp.invoke = service_store.server.worker_store.amqp_invoke # .send is for pre-3.0 backward compat
         class_.amqp.invoke_async = class_.amqp.send = service_store.server.worker_store.amqp_invoke_async
 
         class_._worker_store = service_store.server.worker_store
@@ -155,14 +218,61 @@ def get_service_name(class_obj):
 
 # ################################################################################################################################
 
-class ServiceStore(InitializingObject):
+def get_batch_indexes(services, max_batch_size):
+    # type: (List[InRAMService], int) -> List[int, int]
+
+    # If there is only one service to deploy, we can already return the result
+    if len(services) == 1:
+        return [[0, 1]]
+
+    out = []
+
+    start_idx = 0
+    current_batch_size = 0
+    batch_size_reached = False
+
+    # We expect for indexes to end at this one
+    max_index_possible = len(services)
+
+    # This is needed because current_idx below is not available outside the loop
+    max_index_reached = 0
+
+    # We have more than one service, so we need to iterate through them all
+    for current_idx, item in enumerate(services, 1): # type: (int, InRAMService)
+
+        current_batch_size += item.source_code_info.len_source
+
+        if current_batch_size >= max_batch_size:
+            batch_size_reached = True
+
+        if batch_size_reached:
+            out.append([start_idx, current_idx])
+            start_idx = current_idx
+
+            max_index_reached = current_idx
+
+            current_batch_size = 0
+            batch_size_reached = False
+
+    # It is possible that the for loop above completed before we reached the list's theoretical max index,
+    # this is possible if batch_size_reached is not reached in the last iteration, i.e. there was not enough
+    # of len_source to fill out the whole batch. At this point, the batch must be smaller that the maximum
+    # size allowed so we can just group together anything that is left after the loop.
+    if max_index_reached < max_index_possible:
+        out.append([max_index_reached, max_index_possible])
+
+    return out
+
+# ################################################################################################################################
+
+class ServiceStore(object):
     """ A store of Zato services.
     """
-    def __init__(self, services=None, service_store_config=None, odb=None, server=None):
-        self.services = services
-        self.service_store_config = service_store_config
-        self.odb = odb
-        self.server = server
+    def __init__(self, services=None, odb=None, server=None):
+        self.services = services          # type: dict
+        self.odb = odb                    # type: Any
+        self.server = server              # type: Any
+        self.max_batch_size = 0           # type: int
         self.id_to_impl_name = {}
         self.impl_name_to_id = {}
         self.name_to_impl_name = {}
@@ -172,8 +282,20 @@ class ServiceStore(InitializingObject):
 # ################################################################################################################################
 
     def get_service_class_by_id(self, service_id):
-        impl_name = self.id_to_impl_name[service_id]
-        return self.services[impl_name]
+        try:
+            impl_name = self.id_to_impl_name[service_id]
+        except KeyError:
+            keys_found = sorted(repr(elem) for elem in self.id_to_impl_name.keys())
+            keys_found = [(elem, type(elem)) for elem in keys_found]
+            raise KeyError('No such service_id key `{}` `({})` among `{}`'.format(repr(service_id), type(service_id), keys_found))
+        else:
+            try:
+                return self.services[impl_name]
+            except KeyError:
+                keys_found = sorted(repr(elem) for elem in self.services.keys())
+                keys_found = [(elem, type(elem)) for elem in keys_found]
+                raise KeyError('No such impl_name key `{}` `({})` among `{}`'.format(
+                    repr(impl_name), type(impl_name), keys_found))
 
 # ################################################################################################################################
 
@@ -185,6 +307,11 @@ class ServiceStore(InitializingObject):
 
     def get_service_name_by_id(self, service_id):
         return self.get_service_class_by_id(service_id)['name']
+
+# ################################################################################################################################
+
+    def has_service(self, service_name):
+        return service_name in self.name_to_impl_name
 
 # ################################################################################################################################
 
@@ -238,6 +365,15 @@ class ServiceStore(InitializingObject):
         """
         cache_file_path = os.path.join(base_dir, 'config', 'repo', 'internal-cache.dat')
 
+        sql_services = {}
+        for item in self.odb.get_sql_internal_service_list(self.server.cluster_id):
+            sql_services[item.impl_name] = {
+                'id': item.id,
+                'impl_name': item.impl_name,
+                'is_active': item.is_active,
+                'slow_threshold': item.slow_threshold,
+            }
+
         # sync_internal may be False but if the cache does not exist (which is the case if a server starts up the first time),
         # we need to create it anyway and sync_internal becomes True then. However, the should be created only by the very first
         # worker in a group of workers - the rest can simply assume that the cache is ready to read.
@@ -254,40 +390,250 @@ class ServiceStore(InitializingObject):
                 'service_info': service_info
             }
 
-            deployed = self.import_services_from_anywhere(items, base_dir)
+            logger.info('Deploying and caching internal services (%s)', self.server.name)
+            info = self.import_services_from_anywhere(items, base_dir)
 
-            for class_ in deployed:
-                impl_name = class_.get_impl_name()
+            for service in info.to_process: # type: InRAMService
+
+                class_ = service.service_class
+                impl_name = service.impl_name
+
                 service_info.append({
-                    'class_': class_,
+                    'service_class': class_,
                     'mod': inspect.getmodule(class_),
                     'impl_name': impl_name,
                     'service_id': self.impl_name_to_id[impl_name],
                     'is_active': self.services[impl_name]['is_active'],
                     'slow_threshold': self.services[impl_name]['slow_threshold'],
                     'fs_location': inspect.getfile(class_),
+                    'deployment_info': 'zzz'
                 })
-
 
             # All set, write out the cache file
             f = open(cache_file_path, 'wb')
             f.write(dill_dumps(internal_cache))
             f.close()
 
-            return deployed
+            logger.info('Deployed and cached %d internal services (%s) (%s)',
+                len(info.to_process), info.total_size_human, self.server.name)
+
+            return info.to_process
 
         else:
-            deployed = []
+            logger.info('Deploying cached internal services (%s)', self.server.name)
 
-            f = open(cache_file_path, 'rb')
-            items = bunchify(dill_load(f))
-            f.close()
+            to_process = []
 
-            for item in items.service_info:
-                self._visit_class(item.mod, deployed, item.class_, item.fs_location, True,
-                    item.service_id, item.is_active, item.slow_threshold)
+            try:
+                f = open(cache_file_path, 'rb')
+                dill_items = dill_load(f)
+            except ValueError as e:
+                msg = e.args[0]
+                if _unsupported_pickle_protocol_msg in msg:
+                    msg = msg.replace(_unsupported_pickle_protocol_msg, '').strip()
+                    protocol_found = int(msg)
 
-            return deployed
+                    # If the protocol found is higher than our own, it means that the cache
+                    # was built a Python version higher than our own, we are on Python 2.7
+                    # and cache was created under Python 3.4. In such a case, we need to
+                    # recreate the cache anew.
+                    if protocol_found > highest_pickle_protocol:
+                        logger.info('Cache pickle protocol found `%d` > current highest `%d`, forcing sync_internal',
+                            protocol_found, highest_pickle_protocol)
+                        return self.import_internal_services(items, base_dir, True, is_first)
+
+                    # A different reason, re-raise the erorr then
+                    else:
+                        raise
+
+                # Must be a different kind of a ValueError, propagate it then
+                else:
+                    raise
+            finally:
+                f.close()
+
+            len_si = len(dill_items['service_info'])
+
+            for idx, item in enumerate(dill_items['service_info'], 1):
+                class_ = self._visit_class(item['mod'], item['service_class'], item['fs_location'], True)
+                to_process.append(class_)
+
+            self._store_in_ram(to_process)
+
+            logger.info('Deployed %d cached internal services (%s)', len_si, self.server.name)
+
+            return to_process
+
+# ################################################################################################################################
+
+    def _store_in_ram(self, to_process):
+        # type: (List[DeploymentInfo]) -> None
+
+        # We need to look up all the services in ODB to be able to find their IDs
+        services = self.get_basic_data_services()
+
+        with self.update_lock:
+            for item in to_process: # type: InRAMService
+
+                service_dict = services[item.name]
+                service_id = service_dict['id']
+
+                self.services[item.impl_name] = {}
+                self.services[item.impl_name]['name'] = item.name
+                self.services[item.impl_name]['deployment_info'] = item.deployment_info
+                self.services[item.impl_name]['service_class'] = item.service_class
+
+                self.services[item.impl_name]['is_active'] = item.is_active
+                self.services[item.impl_name]['slow_threshold'] = item.slow_threshold
+
+                if 'hook' in item.name:
+                    print(111, item.impl_name, item.name, service_id)
+
+                self.id_to_impl_name[service_id] = item.impl_name
+                self.impl_name_to_id[item.impl_name] = service_id
+                self.name_to_impl_name[item.name] = item.impl_name
+
+                item.service_class.after_add_to_store(logger)
+
+# ################################################################################################################################
+
+    def _store_services_in_odb(self, session, batch_indexes, to_process):
+        """ Looks up all Service objects in ODB and if any of our local ones is not in the databaset yet, it is added.
+        """
+        # Will be set to True if any of the batches added at list one new service to ODB
+        any_added = False
+
+        # Get all services already deployed in ODB for comparisons (Service)
+        services = self.get_basic_data_services()
+
+        # Add any missing Service objects from each batch delineated by indexes found
+        for start_idx, end_idx in batch_indexes:
+
+            to_add = []
+            batch_services = to_process[start_idx:end_idx]
+
+            for service in batch_services: # type: InRAMService
+
+                # No such Service object in ODB so we need to store it
+                if service.name not in services:
+                    to_add.append(service)
+
+            # Add to ODB all the Service objects from this batch found not to be in ODB already
+            if to_add:
+                self.odb.add_services(session, [elem.to_dict() for elem in to_add])
+                any_added = True
+
+        return any_added
+
+# ################################################################################################################################
+
+    def _store_deployed_services_in_odb(self, session, batch_indexes, to_process, _utcnow=datetime.utcnow):
+        """ Looks up all Service objects in ODB, checks if any is not deployed locally and deploys it if it is not.
+        """
+        # Local objects
+        now = _utcnow()
+        now_iso = now.isoformat()
+
+        # Get all services already deployed in ODB for comparisons (Service) - it is needed to do it again,
+        # in addition to _store_deployed_services_in_odb, because that other method may have added
+        # DB-level IDs that we need with our own objects.
+        services = self.get_basic_data_services()
+
+        # Same goes for deployed services objects (DeployedService)
+        deployed_services = self.get_basic_data_deployed_services()
+
+        # Modules visited may return a service that has been already visited via another module,
+        # in which case we need to skip such a duplicate service.
+        already_visited = set()
+
+        # Add any missing DeployedService objects from each batch delineated by indexes found
+        for start_idx, end_idx in batch_indexes:
+
+            to_add = []
+            batch_services = to_process[start_idx:end_idx]
+
+            for service in batch_services: # type: InRAMService
+
+                if service.name in already_visited:
+                    continue
+                else:
+                    already_visited.add(service.name)
+
+                # At this point we wil always have IDs for all Service objects
+                service_id = services[service.name]['id']
+
+                # Metadata about this deployment as a JSON object
+                class_ = service.service_class
+                path = service.source_code_info.path
+                deployment_details = dumps(deployment_info('service-store', str(class_), now_iso, path))
+
+                # No such Service object in ODB so we need to store it
+                if service.name not in deployed_services:
+                    to_add.append({
+                        'server_id': self.server.id,
+                        'service_id': service_id,
+                        'deployment_time': now,
+                        'details': deployment_details,
+                        'source': service.source_code_info.source,
+                        'source_path': service.source_code_info.path,
+                        'source_hash': service.source_code_info.hash,
+                        'source_hash_method': service.source_code_info.hash_method,
+                    })
+
+            # If any services are to be deployed, do it now.
+            if to_add:
+                self.odb.add_deployed_services(session, to_add)
+
+# ################################################################################################################################
+
+    def _store_in_odb(self, to_process):
+        # type: (List[DeploymentInfo]) -> None
+
+        # Indicates boundaries of deployment batches
+        batch_indexes = get_batch_indexes(to_process, self.max_batch_size)
+
+        with closing(self.odb.session()) as session:
+
+            # Store Service objects first
+            needs_commit = self._store_services_in_odb(session, batch_indexes, to_process)
+
+            # This flag will be True if there were any services to be added,
+            # in which case we need to commit the sesssion here to make it possible
+            # for the next method to have access to these newly added Service objects.
+            if needs_commit:
+                session.commit()
+
+            # Now DeployedService can be added - they assume that all Service objects all are in ODB already
+            self._store_deployed_services_in_odb(session, batch_indexes, to_process)
+
+            # Done with everything, we can commit it now
+            session.commit()
+
+# ################################################################################################################################
+
+    def get_basic_data_services(self):
+        # type: (None) -> dict
+
+        # We will return service keyed by their names
+        out = {}
+
+        # This is a list of services to turn into a dict
+        service_list = self.odb.get_basic_data_service_list()
+
+        for service_id, name, impl_name in service_list: # type: name, name
+            out[name] = {'id': service_id, 'impl_name': impl_name}
+
+        return out
+
+# ################################################################################################################################
+
+    def get_basic_data_deployed_services(self):
+        # type: (None) -> set
+
+        # This is a list of services to turn into a set
+        deployed_service_list = self.odb.get_basic_data_deployed_service_list()
+
+        return set(elem[0] for elem in deployed_service_list)
 
 # ################################################################################################################################
 
@@ -295,7 +641,10 @@ class ServiceStore(InitializingObject):
         """ Imports services from any of the supported sources, be it module names,
         individual files, directories or distutils2 packages (compressed or not).
         """
-        deployed = []
+        # type: (Any, text, text) -> DeploymentInfo
+
+        items = items if isinstance(items, (list, tuple)) else [items]
+        to_process = []
 
         for item in items:
             if has_debug:
@@ -305,34 +654,52 @@ class ServiceStore(InitializingObject):
 
             # A regular directory
             if os.path.isdir(item):
-                deployed.extend(self.import_services_from_directory(item, base_dir))
+                to_process.extend(self.import_services_from_directory(item, base_dir))
 
             # .. a .py/.pyw
             elif is_python_file(item):
-                deployed.extend(self.import_services_from_file(item, is_internal, base_dir))
+                to_process.extend(self.import_services_from_file(item, is_internal, base_dir))
 
             # .. must be a module object
             else:
-                deployed.extend(self.import_services_from_module(item, is_internal))
+                to_process.extend(self.import_services_from_module(item, is_internal))
 
-        return deployed
+        total_size = 0
+
+        to_process = set(to_process)
+        to_process = list(to_process)
+
+        for item in to_process: # type: InRAMService
+            total_size += item.source_code_info.len_source
+
+        info = DeploymentInfo()
+        info.to_process[:] = to_process
+        info.total_size = total_size
+        info.total_size_human = naturalsize(info.total_size)
+
+        # Save data to both ODB and RAM now
+        self._store_in_odb(info.to_process)
+        self._store_in_ram(info.to_process)
+
+        # Done deploying, we can return
+        return info
 
 # ################################################################################################################################
 
     def import_services_from_file(self, file_name, is_internal, base_dir):
         """ Imports all the services from the path to a file.
         """
-        deployed = []
+        to_process = []
 
         try:
             mod_info = import_module_from_path(file_name, base_dir)
-        except Exception, e:
+        except Exception:
             msg = 'Could not load source, file_name:`%s`, e:`%s`'
-            logger.error(msg, file_name, format_exc(e))
+            logger.error(msg, file_name, format_exc())
         else:
-            deployed.extend(self._visit_module(mod_info.module, is_internal, mod_info.file_name))
+            to_process.extend(self._visit_module(mod_info.module, is_internal, mod_info.file_name))
         finally:
-            return deployed
+            return to_process
 
 # ################################################################################################################################
 
@@ -347,19 +714,23 @@ class ServiceStore(InitializingObject):
         of Python source code to import, as is the case with services that have
         been hot-deployed.
         """
-        deployed = []
+        to_process = []
 
         for py_path in visit_py_source(dir_name):
-            deployed.extend(self.import_services_from_file(py_path, False, base_dir))
+            to_process.extend(self.import_services_from_file(py_path, False, base_dir))
 
-        return deployed
+        return to_process
 
 # ################################################################################################################################
 
     def import_services_from_module(self, mod_name, is_internal):
         """ Imports all the services from a module specified by the given name.
         """
-        return self.import_services_from_module_object(import_module(mod_name), is_internal)
+        try:
+            return self.import_services_from_module_object(import_module(mod_name), is_internal)
+        except ImportError:
+            logger.warn('Could not import module `%s` (internal:%d)', mod_name, is_internal)
+            raise
 
 # ################################################################################################################################
 
@@ -394,60 +765,51 @@ class ServiceStore(InitializingObject):
     def _get_source_code_info(self, mod):
         """ Returns the source code of and the FS path to the given module.
         """
-        si = SourceInfo()
+        # type: (Any) -> SourceInfo
+
+        source_info = SourceCodeInfo()
         try:
             file_name = mod.__file__
             if file_name[-1] in('c', 'o'):
                 file_name = file_name[:-1]
 
-            # We would've used inspect.getsource(mod) hadn't it been apparently using
+            # We would have used inspect.getsource(mod) had it not been apparently using
             # cached copies of the source code
-            si.source = open(file_name, 'rb').read()
+            source_info.source = open(file_name, 'rb').read()
+            source_info.len_source = len(source_info.source)
 
-            si.path = inspect.getsourcefile(mod)
-            si.hash = sha256(si.source).hexdigest()
-            si.hash_method = 'SHA-256'
+            source_info.path = inspect.getsourcefile(mod)
+            source_info.hash = sha256(source_info.source).hexdigest()
+            source_info.hash_method = 'SHA-256'
 
-        except IOError, e:
+        except IOError:
             if has_trace1:
-                logger.log(TRACE1, 'Ignoring IOError, mod:`%s`, e:`%s`', mod, format_exc(e))
+                logger.log(TRACE1, 'Ignoring IOError, mod:`%s`, e:`%s`', mod, format_exc())
 
-        return si
+        return source_info
 
 # ################################################################################################################################
 
-    def _visit_class(self, mod, deployed, class_, fs_location, is_internal, service_id=None, is_active=None, slow_threshold=None):
-        timestamp = datetime.utcnow()
-        depl_info = dumps(deployment_info('service-store', str(class_), timestamp.isoformat(), fs_location))
+    def _visit_class(self, mod, class_, fs_location, is_internal, _utcnow=datetime.utcnow):
+        # type: (Any, Any, text, bool, Any, Any) -> InRAMService
 
         name = class_.get_name()
         impl_name = class_.get_impl_name()
 
         set_up_class_attributes(class_, self, name)
 
-        self.services[impl_name] = {}
-        self.services[impl_name]['name'] = name
-        self.services[impl_name]['deployment_info'] = depl_info
-        self.services[impl_name]['service_class'] = class_
+        # Note that at this point we do not have the service's ID, is_active and slow_threshold values;
+        # this is because this object is created prior to its deployment in ODB.
+        service = InRAMService()
+        service.cluster_id = self.server.cluster_id
+        service.is_active = True
+        service.is_internal = is_internal
+        service.name = name
+        service.impl_name = impl_name
+        service.service_class = class_
+        service.source_code_info = self._get_source_code_info(mod)
 
-        si = self._get_source_code_info(mod)
-
-        service_id, is_active, slow_threshold = self.odb.add_service(
-            name, impl_name, is_internal, timestamp, dumps(str(depl_info)), si)
-
-        deployed.append(class_)
-
-        self.services[impl_name]['is_active'] = is_active
-        self.services[impl_name]['slow_threshold'] = slow_threshold
-
-        self.id_to_impl_name[service_id] = impl_name
-        self.impl_name_to_id[impl_name] = service_id
-        self.name_to_impl_name[name] = impl_name
-
-        if has_debug:
-            logger.debug('Imported service:`%s`', name)
-
-        class_.after_add_to_store(logger)
+        return service
 
 # ################################################################################################################################
 
@@ -461,7 +823,7 @@ class ServiceStore(InitializingObject):
     def _visit_module(self, mod, is_internal, fs_location, needs_odb_deployment=True):
         """ Actually imports services from a module object.
         """
-        deployed = []
+        to_process = []
         try:
             for name in sorted(dir(mod)):
                 with self.update_lock:
@@ -469,15 +831,15 @@ class ServiceStore(InitializingObject):
 
                     if self._should_deploy(name, item):
                         if item.before_add_to_store(logger):
-                            self._visit_class(mod, deployed, item, fs_location, is_internal)
+                            to_process.append(self._visit_class(mod, item, fs_location, is_internal))
                         else:
                             logger.info('Skipping `%s` from `%s`', item, fs_location)
 
-        except Exception, e:
+        except Exception:
             logger.error(
                 'Exception while visiting mod:`%s`, is_internal:`%s`, fs_location:`%s`, e:`%s`',
-                mod, is_internal, fs_location, format_exc(e))
+                mod, is_internal, fs_location, format_exc())
         finally:
-            return deployed
+            return to_process
 
 # ################################################################################################################################

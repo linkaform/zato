@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -17,6 +17,9 @@ from uuid import uuid4
 # SQLAlchemy
 from sqlalchemy.exc import IntegrityError
 
+# Python 2/3 compatibility
+from future.utils import iteritems
+
 # Zato
 from zato.cli import common_odb_opts, get_tech_account_opts, ZatoCommand
 from zato.common import CACHE, CONNECTION, DATA_FORMAT, IPC, MISC, PUBSUB, SIMPLE_IO, URL_TYPE
@@ -24,7 +27,10 @@ from zato.common.odb.model import CacheBuiltin, Cluster, HTTPBasicAuth, HTTPSOAP
      PubSubSubscription, PubSubTopic, RBACClientRole, RBACPermission, RBACRole, RBACRolePermission, Service, WSSDefinition
 from zato.common.pubsub import new_sub_key
 from zato.common.util import get_http_json_channel, get_http_soap_channel
+from zato.common.util.json_ import dumps
 from zato.common.util.time_ import utcnow_as_ms
+
+# ################################################################################################################################
 
 zato_services = {
 
@@ -428,6 +434,7 @@ zato_services = {
     'zato.service.slow-response.get':'zato.server.service.internal.service.GetSlowResponse',
     'zato.service.slow-response.get-list':'zato.server.service.internal.service.GetSlowResponseList',
     'zato.service.upload-package':'zato.server.service.internal.service.UploadPackage',
+    'pub.zato.service.service-invoker':'zato.server.service.internal.service.ServiceInvoker',
 
     # Statistics
     'zato.stats.delete':'zato.server.service.internal.stats.Delete',
@@ -439,6 +446,11 @@ zato_services = {
     'zato.stats.summary.get-summary-by-year':'zato.server.service.internal.stats.summary.GetSummaryByYear',
     'zato.stats.trends.get-trends':'zato.server.service.internal.stats.trends.GetTrends',
 }
+
+# ################################################################################################################################
+
+def new_password():
+    return uuid4().hex
 
 # ################################################################################################################################
 
@@ -478,11 +490,11 @@ class Create(ZatoCommand):
                 args, 'admin_invoke_password', None) or getattr(args, 'tech_account_password'), cluster)
         session.add(admin_invoke_sec)
 
-        pubapi_sec = HTTPBasicAuth(None, 'pubapi', True, 'pubapi', 'Zato public API', uuid4().hex, cluster)
+        pubapi_sec = HTTPBasicAuth(None, 'pubapi', True, 'pubapi', 'Zato public API', new_password(), cluster)
         session.add(pubapi_sec)
 
         internal_invoke_sec = HTTPBasicAuth(None, 'zato.internal.invoke', True, 'zato.internal.invoke.user',
-            'Zato internal invoker', uuid4().hex, cluster)
+            'Zato internal invoker', new_password(), cluster)
         session.add(internal_invoke_sec)
 
         self.add_default_rbac_permissions(session, cluster)
@@ -506,10 +518,10 @@ class Create(ZatoCommand):
 
         try:
             session.commit()
-        except IntegrityError, e:
+        except IntegrityError as e:
             msg = 'SQL IntegrityError caught `{}`'.format(e.message)
             if self.verbose:
-                msg += '\nDetails:`{}`'.format(format_exc(e).decode('utf-8'))
+                msg += '\nDetails:`{}`'.format(format_exc().decode('utf-8'))
                 self.logger.error(msg)
             self.logger.error(msg)
             session.rollback()
@@ -525,6 +537,14 @@ class Create(ZatoCommand):
 
 # ################################################################################################################################
 
+    def add_api_invoke(self, session, cluster, service, pubapi_sec):
+        channel = HTTPSOAP(None, '/zato/api/invoke', True, True, 'channel', 'plain_http',
+            None, '/zato/api/invoke/{service_name}', None, '', None, None, merge_url_params_req=True, service=service,
+            cluster=cluster)
+        session.add(channel)
+
+# ################################################################################################################################
+
     def add_internal_services(self, session, cluster, admin_invoke_sec, pubapi_sec, internal_invoke_sec, ide_pub_rbac_role):
         """ Adds these Zato internal services that can be accessed through SOAP requests.
         """
@@ -532,7 +552,7 @@ class Create(ZatoCommand):
         # HTTPSOAP + services
         #
 
-        for name, impl_name in zato_services.iteritems():
+        for name, impl_name in iteritems(zato_services):
 
             service = Service(None, name, True, impl_name, True, cluster)
             session.add(service)
@@ -543,6 +563,9 @@ class Create(ZatoCommand):
                     None, '{}.soap'.format(name), True, True, 'channel', 'plain_http',
                     None, '/zato/wsdl', None, '', None, None, service=service, cluster=cluster)
                 session.add(http_soap)
+
+            elif name == 'pub.zato.service.service-invoker':
+                self.add_api_invoke(session, cluster, service, pubapi_sec)
 
             elif name == 'zato.service.invoke':
                 self.add_admin_invoke(session, cluster, service, admin_invoke_sec)
@@ -556,7 +579,7 @@ class Create(ZatoCommand):
 
             elif name == 'zato.ide-deploy.create':
                 self.add_rbac_channel(session, cluster, service, ide_pub_rbac_role, '/ide-deploy', permit_write=True,
-                                      data_format=DATA_FORMAT.JSON)
+                    data_format=DATA_FORMAT.JSON)
 
             elif 'check' in name:
                 self.add_check(session, cluster, service, pubapi_sec)
@@ -576,7 +599,7 @@ class Create(ZatoCommand):
         }
 
         for password in passwords:
-            passwords[password] = uuid4().hex
+            passwords[password] = new_password()
 
         ping_impl_name = 'zato.server.service.internal.Ping'
         ping_service_name = 'zato.ping'
@@ -699,7 +722,7 @@ class Create(ZatoCommand):
         role = RBACRole(name=role_name, parent=root_rbac_role, cluster=cluster)
         session.add(role)
 
-        auth = HTTPBasicAuth(None, account_name, True, account_name, realm, uuid4().hex, cluster)
+        auth = HTTPBasicAuth(None, account_name, True, account_name, realm, new_password(), cluster)
         session.add(auth)
 
         client_role_def = MISC.SEPARATOR.join(('sec_def', 'basic_auth', account_name))
@@ -854,10 +877,10 @@ class Create(ZatoCommand):
             'zato.cache.builtin.pubapi.set-contains-any':    'zato.server.service.internal.cache.builtin.pubapi.SetContainsAny',
         }
 
-        sec = HTTPBasicAuth(None, 'zato.default.cache.client', True, 'zato.cache', 'Zato cache', uuid4().hex, cluster)
+        sec = HTTPBasicAuth(None, 'zato.default.cache.client', True, 'zato.cache', 'Zato cache', new_password(), cluster)
         session.add(sec)
 
-        for name, impl_name in service_to_impl.iteritems():
+        for name, impl_name in iteritems(service_to_impl):
 
             service = Service(None, name, True, impl_name, True, cluster)
             session.add(service)
@@ -891,10 +914,10 @@ class Create(ZatoCommand):
             'zato.crypto.generate-password':  'zato.server.service.internal.crypto.GeneratePassword',
         }
 
-        sec = HTTPBasicAuth(None, 'zato.default.crypto.client', True, 'zato.crypto', 'Zato crypto', uuid4().hex, cluster)
+        sec = HTTPBasicAuth(None, 'zato.default.crypto.client', True, 'zato.crypto', 'Zato crypto', new_password(), cluster)
         session.add(sec)
 
-        for name, impl_name in service_to_impl.iteritems():
+        for name, impl_name in iteritems(service_to_impl):
 
             service = Service(None, name, True, impl_name, True, cluster)
             session.add(service)
@@ -910,11 +933,11 @@ class Create(ZatoCommand):
 
     def add_pubsub_sec_endpoints(self, session, cluster):
 
-        sec_demo = HTTPBasicAuth(None, 'zato.pubsub.demo.secdef', True, 'zato.pubsub.demo', 'Zato pub/sub demo', uuid4().hex, cluster)
+        sec_demo = HTTPBasicAuth(None, 'zato.pubsub.demo.secdef', True, 'zato.pubsub.demo', 'Zato pub/sub demo', new_password(), cluster)
         session.add(sec_demo)
 
         sec_default_internal = HTTPBasicAuth(None, 'zato.pubsub.internal.secdef', True, 'zato.pubsub.internal',
-            'Zato pub/sub internal', uuid4().hex, cluster)
+            'Zato pub/sub internal', new_password(), cluster)
         session.add(sec_default_internal)
 
         impl_name1 = 'zato.server.service.internal.pubsub.pubapi.TopicService'
@@ -927,25 +950,33 @@ class Create(ZatoCommand):
         service_msg = Service(None, 'zato.pubsub.pubapi.message-service', True, impl_name3, True, cluster)
         service_demo = Service(None, 'zato.pubsub.helpers.json-raw-request-logger', True, impl_demo, True, cluster)
 
+        # Opaque data that lets clients use topic contain slash characters
+        opaque = dumps({'match_slash':True})
+
         chan_topic = HTTPSOAP(None, 'zato.pubsub.topic.topic_name', True, True, CONNECTION.CHANNEL,
             URL_TYPE.PLAIN_HTTP, None, '/zato/pubsub/topic/{topic_name}',
-            None, '', None, DATA_FORMAT.JSON, security=None, service=service_topic, cluster=cluster)
+            None, '', None, DATA_FORMAT.JSON, security=None, service=service_topic, opaque=opaque,
+            cluster=cluster)
 
         chan_sub = HTTPSOAP(None, 'zato.pubsub.subscribe.topic.topic_name', True, True, CONNECTION.CHANNEL,
             URL_TYPE.PLAIN_HTTP, None, '/zato/pubsub/subscribe/topic/{topic_name}',
-            None, '', None, DATA_FORMAT.JSON, security=None, service=service_sub, cluster=cluster)
+            None, '', None, DATA_FORMAT.JSON, security=None, service=service_sub, opaque=opaque,
+            cluster=cluster)
 
         chan_msg = HTTPSOAP(None, 'zato.pubsub.msg.msg_id', True, True, CONNECTION.CHANNEL,
             URL_TYPE.PLAIN_HTTP, None, '/zato/pubsub/msg/{msg_id}',
-            None, '', None, DATA_FORMAT.JSON, security=None, service=service_msg, cluster=cluster)
+            None, '', None, DATA_FORMAT.JSON, security=None, service=service_msg, opaque=opaque,
+            cluster=cluster)
 
         chan_demo = HTTPSOAP(None, 'pubsub.demo.sample.channel', True, True, CONNECTION.CHANNEL,
             URL_TYPE.PLAIN_HTTP, None, '/zato/pubsub/zato.demo.sample',
-            None, '', None, DATA_FORMAT.JSON, security=sec_demo, service=service_demo, cluster=cluster)
+            None, '', None, DATA_FORMAT.JSON, security=sec_demo, service=service_demo, opaque=opaque,
+            cluster=cluster)
 
         outconn_demo = HTTPSOAP(None, 'pubsub.demo.sample.outconn', True, True, CONNECTION.OUTGOING,
             URL_TYPE.PLAIN_HTTP, 'http://localhost:11223', '/zato/pubsub/zato.demo.sample',
-            None, '', None, DATA_FORMAT.JSON, security=sec_demo, cluster=cluster)
+            None, '', None, DATA_FORMAT.JSON, security=sec_demo, opaque=opaque,
+            cluster=cluster)
 
         endpoint_default_internal = PubSubEndpoint()
         endpoint_default_internal.name = PUBSUB.DEFAULT.INTERNAL_ENDPOINT_NAME
@@ -1010,7 +1041,7 @@ class Create(ZatoCommand):
         service = Service(None, 'zato.channel.jms-wmq.on-message-received', True, impl_name, True, cluster)
 
         wmq_username = IPC.CONNECTOR.IBM_MQ.USERNAME
-        wmq_sec = HTTPBasicAuth(None, wmq_username, True, wmq_username, 'Zato IBM MQ', uuid4().hex, cluster)
+        wmq_sec = HTTPBasicAuth(None, wmq_username, True, wmq_username, 'Zato IBM MQ', new_password(), cluster)
 
         channel = HTTPSOAP(None, 'zato.internal.callback.wmq', True, True, 'channel', 'plain_http', None,
             '/zato/internal/callback/wmq',

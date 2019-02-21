@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2014 Dariusz Suchojad <dsuch at zato.io>
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -15,6 +15,9 @@ from datetime import datetime
 # SQLAlchemy
 from sqlalchemy.orm.exc import NoResultFound
 
+# Python 2/3 compatibility
+from six import add_metaclass
+
 # Zato
 from zato.common import NOTIF as COMMON_NOTIF, SECRET_SHADOW
 from zato.common.broker_message import NOTIF
@@ -24,9 +27,12 @@ from zato.server.service.internal import AdminService
 from zato.server.service.internal.notif import NotifierService
 from zato.server.service.meta import CreateEditMeta, DeleteMeta, GetListMeta
 
+# ################################################################################################################################
+
 elem = 'notif_sql'
 model = NotificationSQL
 label = 'an SQL notification'
+get_list_docs = 'SQL notifications'
 broker_message = NOTIF
 broker_message_prefix = 'SQL_'
 list_func = notif_sql_list
@@ -35,6 +41,8 @@ create_edit_input_required_extra = ['service_name']
 create_edit_rewrite = ['service_name']
 skip_input_params = ('notif_type', 'service_id', 'get_data_patt', 'get_data', 'get_data_patt_neg', 'name_pattern_neg', 'name_pattern')
 skip_output_params = ('get_data', 'get_data_patt_neg', 'get_data_patt', 'name_pattern_neg', 'name_pattern')
+
+# ################################################################################################################################
 
 def instance_hook(service, input, instance, attrs):
     instance.notif_type = COMMON_NOTIF.TYPE.SQL
@@ -46,22 +54,37 @@ def instance_hook(service, input, instance, attrs):
             filter(Service.cluster_id==input.cluster_id).\
             one().id
 
+# ################################################################################################################################
+
 def broker_message_hook(service, input, instance, attrs, service_type):
     if service_type == 'create_edit':
         input.notif_type = COMMON_NOTIF.TYPE.SQL
 
+# ################################################################################################################################
+
+@add_metaclass(GetListMeta)
 class GetList(AdminService):
     _filter_by = NotificationSQL.name,
-    __metaclass__ = GetListMeta
 
+# ################################################################################################################################
+
+@add_metaclass(CreateEditMeta)
 class Create(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
+# ################################################################################################################################
+
+@add_metaclass(CreateEditMeta)
 class Edit(AdminService):
-    __metaclass__ = CreateEditMeta
+    pass
 
+# ################################################################################################################################
+
+@add_metaclass(DeleteMeta)
 class Delete(AdminService):
-    __metaclass__ = DeleteMeta
+    pass
+
+# ################################################################################################################################
 
 class RunNotifier(NotifierService):
     notif_type = COMMON_NOTIF.TYPE.SQL
@@ -91,3 +114,5 @@ class RunNotifier(NotifierService):
                 out.append(dict_row)
 
             self.invoke_async(config.service_name, {'data':out})
+
+# ################################################################################################################################

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -10,11 +10,10 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 from datetime import datetime, timedelta
-from httplib import BAD_REQUEST, INTERNAL_SERVER_ERROR, NOT_FOUND, responses
+from http.client import BAD_REQUEST, INTERNAL_SERVER_ERROR, NOT_FOUND, responses
 from logging import getLogger
 from threading import current_thread
 from traceback import format_exc
-from urlparse import urlparse
 
 # Bunch
 from bunch import Bunch, bunchify
@@ -31,12 +30,17 @@ from ws4py.websocket import WebSocket as _WebSocket
 from ws4py.server.geventserver import WSGIServer
 from ws4py.server.wsgiutils import WebSocketWSGIApplication
 
+# Python 2/3 compatibility
+from future.moves.urllib.parse import urlparse
+from past.builtins import basestring
+
 # Zato
 from zato.common import CHANNEL, DATA_FORMAT, ParsingException, PUBSUB, SEC_DEF_TYPE, WEB_SOCKET
 from zato.common.exception import Reportable
 from zato.common.pubsub import HandleNewMessageCtx, MSG_PREFIX, PubSubMessage
 from zato.common.util import new_cid
 from zato.common.util.hook import HookTool
+from zato.common.util.wsx import cleanup_wsx_client
 from zato.server.connection.connector import Connector
 from zato.server.connection.web_socket.msg import AuthenticateResponse, InvokeClientRequest, ClientMessage, copy_forbidden, \
      error_response, ErrorResponse, Forbidden, OKResponse, InvokeClientPubSubRequest
@@ -50,7 +54,7 @@ logger_zato = getLogger('zato')
 
 # ################################################################################################################################
 
-http404 = b'{} {}'.format(NOT_FOUND, responses[NOT_FOUND])
+http404 = '{} {}'.format(NOT_FOUND, responses[NOT_FOUND])
 
 # ################################################################################################################################
 
@@ -74,7 +78,7 @@ class HookCtx(object):
     __slots__ = ('hook_type', 'config', 'pub_client_id', 'ext_client_id', 'ext_client_name', 'connection_time', 'user_data',
         'forwarded_for', 'forwarded_for_fqdn', 'peer_address', 'peer_host', 'peer_fqdn', 'peer_conn_info_pretty', 'msg')
 
-    def __init__(self, hook_type, **kwargs):
+    def __init__(self, hook_type, *args, **kwargs):
         self.hook_type = hook_type
         for name in self.__slots__:
             if name != 'hook_type':
@@ -170,10 +174,10 @@ class WebSocket(_WebSocket):
         # point but they are never seen again, which may (theoretically) happen if a peer disconnects
         # in a way that does not allow for Zato to clean up its subscription status in the ODB.
         #
-        self.pubsub_interact_interval = PUBSUB.DEFAULT.WSX_INTERACT_UPDATE_INTERVAL
-        self.pubsub_interact_last_updated = None
-        self.pubsub_interact_source = None
-        self.pubsub_interact_last_set = None
+        self.pubsub_interact_interval = WEB_SOCKET.DEFAULT.INTERACT_UPDATE_INTERVAL
+        self.interact_last_updated = None
+        self.last_interact_source = None
+        self.interact_last_set = None
 
         # Manages access to service hooks
         if self.config.hook_service:
@@ -275,48 +279,52 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
-    def update_pubsub_state(self, source, _now=datetime.utcnow, _interval=PUBSUB.DEFAULT.WSX_INTERACT_UPDATE_INTERVAL):
+    def set_last_interaction_data(self, source, _now=datetime.utcnow, _interval=WEB_SOCKET.DEFAULT.INTERACT_UPDATE_INTERVAL):
         """ Updates metadata regarding pub/sub about this WSX connection.
         """
         with self.update_lock:
 
             # Local aliases
             now = _now()
-            sub_keys = self.pubsub_tool.get_sub_keys()
-
-            # Do not run update anything if the WSX is not subscribed to any topic
-            if not sub_keys:
-                return
 
             # Update last interaction metadata time for our peer
-            self.pubsub_interact_source = source
+            self.last_interact_source = source
 
             # It is possible that we set the metadata the first time,
-            # in which case we will always invoke the service, having first stored now for later use.
-            if not self.pubsub_interact_last_set:
-                self.pubsub_interact_last_set = now
-                needs_service = True
+            # in which case we will always invoke the service, having first stored current timestamp for later use.
+            if not self.interact_last_set:
+                self.interact_last_set = now
+                needs_services = True
             else:
 
-                # We must have been already called before, in which case we execute the service only
-                # if it is our time to do it.
-                needs_service = True if self.pubsub_interact_last_updated + timedelta(minutes=_interval) < now else False
+                # We must have been already called before, in which case we execute services only if it is our time to do it.
+                needs_services = True if self.interact_last_updated + timedelta(minutes=_interval) < now else False
 
-            # Are we to invoke the service this time?
-            if needs_service:
+            # Are we to invoke the services this time?
+            if needs_services:
 
-                request = {
+                now_formatted = now.isoformat()
+
+                pub_sub_request = {
                     'sub_key': self.pubsub_tool.get_sub_keys(),
-                    'last_interaction_time': now.isoformat(),
-                    'last_interaction_type': self.pubsub_interact_source,
+                    'last_interaction_time': now_formatted,
+                    'last_interaction_type': self.last_interact_source,
                     'last_interaction_details': self.get_peer_info_pretty(),
                 }
 
-                logger.info('Setting pub/sub interaction metadata `%s`', request)
-                self.invoke_service('zato.pubsub.subscription.update-interaction-metadata', request)
+                wsx_request = {
+                    'id': self.sql_ws_client_id,
+                    'last_seen': now_formatted,
+                }
+
+                logger.info('Setting pub/sub interaction metadata `%s`', pub_sub_request)
+                self.invoke_service('zato.pubsub.subscription.update-interaction-metadata', pub_sub_request)
+
+                logger.info('Setting WSX last seen `%s`', wsx_request)
+                self.invoke_service('zato.channel.web-socket.client.set-last-seen', wsx_request)
 
                 # Finally, store it for the future use
-                self.pubsub_interact_last_updated = now
+                self.interact_last_updated = now
 
 # ################################################################################################################################
 
@@ -355,7 +363,7 @@ class WebSocket(_WebSocket):
         self.invoke_client(cid, data, ctx=ctx, _Class=InvokeClientPubSubRequest)
 
         # We get here if there was no exception = we can update pub/sub metadata
-        self.update_pubsub_state('pubsub.deliver_pubsub_msg')
+        self.set_last_interaction_data('pubsub.deliver_pubsub_msg')
 
 # ################################################################################################################################
 
@@ -371,6 +379,20 @@ class WebSocket(_WebSocket):
 
     def add_pubsub_message(self, sub_key, message):
         self.pubsub_tool.add_message(sub_key, message)
+
+# ################################################################################################################################
+
+    def get_peer_info_dict(self):
+        return {
+            'name': self.ext_client_name,
+            'ext_client_id': self.ext_client_id,
+            'forwarded_for_fqdn': self.forwarded_for_fqdn,
+            'peer_fqdn': self._peer_fqdn,
+            'pub_client_id': self.pub_client_id,
+            'python_id': self.python_id,
+            'sock': str(getattr(self, 'sock', '')),
+            'swc': self.sql_ws_client_id,
+        }
 
 # ################################################################################################################################
 
@@ -407,7 +429,7 @@ class WebSocket(_WebSocket):
 
     def parse_json(self, data, _create_session=WEB_SOCKET.ACTION.CREATE_SESSION, _response=WEB_SOCKET.ACTION.CLIENT_RESPONSE):
 
-        parsed = loads(data)
+        parsed = loads(data.decode('utf8'))
         msg = ClientMessage()
 
         meta = parsed.get('meta', {})
@@ -522,14 +544,14 @@ class WebSocket(_WebSocket):
         logger.info('Starting WSX background pings for `%s`', self.peer_conn_info_pretty)
 
         try:
-            while self.stream:
+            while self.stream and (not self.server_terminated):
 
                 # Sleep for N seconds before sending a ping but check if we are connected upfront because
                 # we could have disconnected in between while and sleep calls.
                 sleep(ping_extend)
 
                 # Ok, still connected
-                if self.stream:
+                if self.stream and (not self.server_terminated):
                     try:
                         response = self.invoke_client(new_cid(), None, use_send=False)
                     except RuntimeError:
@@ -554,7 +576,7 @@ class WebSocket(_WebSocket):
                                 self.on_forbidden('missed {}/{} ping messages'.format(
                                     self.pings_missed, self.pings_missed_threshold))
 
-                # No stream = already disconnected, we can quit
+                # No stream or server already = we can quit
                 else:
                     return
 
@@ -613,27 +635,14 @@ class WebSocket(_WebSocket):
     def unregister_auth_client(self):
         """ Unregisters an already registered peer in ODB.
         """
-        if self.has_session_opened:
-
-            # Deletes state from SQL
-            self.invoke_service('zato.channel.web-socket.client.delete-by-pub-id', {
-                'pub_client_id': self.pub_client_id,
-            })
-
-            if self.pubsub_tool.sub_keys:
-
-                # Deletes across all workers the in-RAM pub/sub state about the client that is disconnecting
-                self.invoke_service('zato.channel.web-socket.client.unregister-ws-sub-key', {
-                    'sub_key_list': list(self.pubsub_tool.sub_keys),
-                })
-
-                # Clears out our own delivery tasks
-                self.pubsub_tool.remove_all_sub_keys()
-
-        # Run the relevant on_connected hook, if any is available (even if the session was never opened)
         hook = self.get_on_disconnected_hook()
-        if hook:
-            hook(WEB_SOCKET.HOOK_TYPE.ON_DISCONNECTED, self.config.hook_service, **self._get_hook_request())
+        hook_request = self._get_hook_request() if hook else None
+
+        # To clear out our own delivery tasks
+        opaque_func_list = [self.pubsub_tool.remove_all_sub_keys]
+
+        cleanup_wsx_client(self.has_session_opened, self.invoke_service, self.pub_client_id, list(self.pubsub_tool.sub_keys),
+            self.get_on_disconnected_hook(), self.config.hook_service, hook_request, opaque_func_list)
 
 # ################################################################################################################################
 
@@ -835,8 +844,8 @@ class WebSocket(_WebSocket):
 
             logger.info('Response returned cid:`%s`, time:`%s`', cid, _now()-now)
 
-        except Exception, e:
-            logger.warn(format_exc(e))
+        except Exception:
+            logger.warn(format_exc())
 
 # ################################################################################################################################
 
@@ -926,7 +935,7 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
-    def disconnect_client(self, cid):
+    def disconnect_client(self, _ignored_cid=None):
         """ Disconnects the remote client, cleaning up internal resources along the way.
         """
         self._disconnect_requested = True
@@ -945,7 +954,7 @@ class WebSocket(_WebSocket):
 
     def closed(self, _ignored_code=None, _ignored_reason=None):
 
-        # The diconnect requested already cleaned up everything
+        # Our self.disconnect_client must have cleaned up everything already
         if not self._disconnect_requested:
             self._close_connection('Closing connection from')
 
@@ -958,11 +967,39 @@ class WebSocket(_WebSocket):
         # Pretend it's an actual response from the client,
         # we cannot use in_reply_to because pong messages are 1:1 copies of ping ones.
         # TODO: Use lxml for XML eventually but for now we are always using JSON
-        self.responses_received[_loads(msg.data)['meta']['id']] = True
+        self.responses_received[_loads(msg.data.decode('utf8'))['meta']['id']] = True
 
         # Since we received a pong response, it means that the peer is connected,
         # in which case we update its pub/sub metadata.
-        self.update_pubsub_state('wsx.ponged')
+        self.set_last_interaction_data('wsx.ponged')
+
+# ################################################################################################################################
+
+    def unhandled_error(self, e, _msg='Low-level exception caught, about to close connection from `%s`, e:`%s`'):
+        """ Called by the underlying WSX library when a low-level TCP/OS exception occurs.
+        """
+        peer_info = self.get_peer_info_pretty()
+        exc = format_exc()
+
+        logger.info(_msg, peer_info, exc)
+        logger_zato.info(_msg, peer_info, exc)
+
+        self.disconnect_client()
+
+    def close(self, code=1000, reason='', _msg='Error while closing connection from `%s`, e:`%s`'):
+        """ Re-implemented from the base class to be able to catch exceptions in self._write when closing connections.
+        """
+        if not self.server_terminated:
+            self.server_terminated = True
+            try:
+                self._write(self.stream.close(code=code, reason=reason).single(mask=self.stream.always_mask))
+            except Exception:
+
+                peer_info = self.get_peer_info_pretty()
+                exc = format_exc()
+
+                logger.info(_msg, peer_info, exc)
+                logger_zato.info(_msg, peer_info, exc)
 
 # ################################################################################################################################
 
@@ -1076,7 +1113,7 @@ class ChannelWebSocket(Connector):
     def _start(self):
         self.server = WebSocketServer(self.config, self.auth_func, self.on_message_callback)
         self.is_connected = True
-        self.server.serve_forever()
+        self.server.start()
 
     def _stop(self):
         self.server.stop(3)

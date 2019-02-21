@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2018, Zato Source s.r.o. https://zato.io
+Copyright (C) 2019, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -11,8 +11,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # stdlib
 import logging
 from datetime import datetime
-from httplib import BAD_REQUEST, METHOD_NOT_ALLOWED
-from sys import maxint
+from http.client import BAD_REQUEST, METHOD_NOT_ALLOWED
 from traceback import format_exc
 
 # anyjson
@@ -28,9 +27,13 @@ from lxml.objectify import ObjectifiedElement
 # gevent
 from gevent import Timeout, spawn
 
+# Python 2/3 compatibility
+from past.builtins import basestring
+from zato.common.py23_ import maxint
+
 # Zato
 from zato.bunch import Bunch
-from zato.common import BROKER, CHANNEL, DATA_FORMAT, Inactive, KVDB, PARAMS_PRIORITY, PUBSUB, WEB_SOCKET, \
+from zato.common import BROKER, CHANNEL, DATA_FORMAT, Inactive, KVDB, NO_DEFAULT_VALUE, PARAMS_PRIORITY, PUBSUB, WEB_SOCKET, \
      ZatoException, zato_no_op_marker
 from zato.common.broker_message import SERVICE
 from zato.common.exception import Reportable
@@ -47,7 +50,7 @@ from zato.server.pattern.fanout import FanOut
 from zato.server.pattern.invoke_retry import InvokeRetry
 from zato.server.pattern.parallel import ParallelExec
 from zato.server.pubsub import PubSub
-from zato.server.service.reqresp import AMQPRequestData, Cloud, Outgoing, Request, Response, WebSphereMQRequestData
+from zato.server.service.reqresp import AMQPRequestData, Cloud, IBMMQRequestData, Outgoing, Request, Response
 
 # Not used here in this module but it's convenient for callers to be able to import everything from a single namespace
 from zato.server.service.reqresp.sio import AsIs, CSV, Boolean, Date, DateTime, Dict, Float, ForceType, Integer, List, \
@@ -70,13 +73,21 @@ Opaque = Opaque
 Unicode = Unicode
 UTC = UTC
 
+# ################################################################################################################################
+
 logger = logging.getLogger(__name__)
 
+# ################################################################################################################################
+
 NOT_GIVEN = 'ZATO_NOT_GIVEN'
+
+# ################################################################################################################################
 
 # Back compat
 Bool = Boolean
 Int = Integer
+
+# ################################################################################################################################
 
 # For code completion
 PubSub = PubSub
@@ -94,14 +105,14 @@ after_handle_hooks = ('after_handle', 'finalize_handle')
 def call_hook_no_service(hook):
     try:
         hook()
-    except Exception, e:
-        logger.error('Can\'t run hook `%s`, e:`%s`', hook, format_exc(e))
+    except Exception:
+        logger.error('Can\'t run hook `%s`, e:`%s`', hook, format_exc())
 
 def call_hook_with_service(hook, service):
     try:
         hook(service)
-    except Exception, e:
-        logger.error('Can\'t run hook `%s`, e:`%s`', hook, format_exc(e))
+    except Exception:
+        logger.error('Can\'t run hook `%s`, e:`%s`', hook, format_exc())
 
 # ################################################################################################################################
 
@@ -258,7 +269,7 @@ class Service(object):
             self._worker_config.out_soap,
             self._worker_store.sql_pool_store,
             self._worker_store.stomp_outconn_api,
-            ZMQFacade(self.server) if self.component_enabled_zeromq else None,
+            ZMQFacade(self._worker_store.zmq_out_api) if self.component_enabled_zeromq else NO_DEFAULT_VALUE,
             self._worker_store.outconn_wsx,
             self._worker_store.vault_conn_api,
             SMSAPI(self._worker_store.sms_twilio_api) if self.component_enabled_sms else None,
@@ -448,7 +459,7 @@ class Service(object):
         # implemented by user services.
         if (not self.accept) or service.accept():
 
-            # Assume everything goes fine
+            # Assumes it goes fine by default
             e, exc_formatted = None, None
 
             try:
@@ -497,8 +508,9 @@ class Service(object):
                 if service.finalize_handle:
                     _call_hook_no_service(service.finalize_handle)
 
-            except Exception, e:
-                exc_formatted = format_exc(e)
+            except Exception as ex:
+                e = ex
+                exc_formatted = format_exc()
                 logger.warn(exc_formatted)
 
             finally:
@@ -511,10 +523,10 @@ class Service(object):
                             self.patterns.parallel.on_call_finished
                         spawn(func, self, service.response.payload, exc_formatted)
 
-                except Exception, resp_e:
+                except Exception as resp_e:
 
                     # If we already have an exception around, log the new one but don't overwrite the old one with it.
-                    logger.warn('Exception in service `%s`, e:`%s`', service.name, format_exc(resp_e))
+                    logger.warn('Exception in service `%s`, e:`%s`', service.name, format_exc())
 
                     if e:
                         if isinstance(e, Reportable):
@@ -525,7 +537,7 @@ class Service(object):
 
                 else:
                     if e:
-                        raise
+                        raise e if isinstance(e, Exception) else Exception(e)
 
         # We don't accept it but some response needs to be returned anyway.
         else:
@@ -582,8 +594,8 @@ class Service(object):
                         raise
             else:
                 return self.update_handle(*invoke_args, **kwargs)
-        except Exception, e:
-            logger.warn('Could not invoke `%s`, e:`%s`', service.name, format_exc(e))
+        except Exception:
+            logger.warn('Could not invoke `%s`, e:`%s`', service.name, format_exc())
             raise
 
     def invoke(self, name, *args, **kwargs):
@@ -708,13 +720,23 @@ class Service(object):
         # Sample requests/responses
         #
 
-        if self._req_resp_freq and self.usage % self._req_resp_freq == 0:
+        slow_response_enabled = self.server.component_enabled.slow_response
+        needs_usage = self._req_resp_freq and self.usage % self._req_resp_freq == 0
+
+        if slow_response_enabled or needs_usage:
+            raw_request = self.request.raw_request
+            if not raw_request:
+                req = ''
+            else:
+                req = raw_request if isinstance(raw_request, basestring) else repr(raw_request)
+
+        if needs_usage:
 
             data = {
                 'cid': self.cid,
                 'req_ts': self.invocation_time.isoformat(),
                 'resp_ts': self.handle_return_time.isoformat(),
-                'req': self.request.raw_request or '',
+                'req': req,
                 'resp':_get_response_value(self.response), # TODO: Don't parse it here and a moment later below
             }
             self.kvdb.conn.hmset(key, data)
@@ -722,9 +744,15 @@ class Service(object):
         #
         # Slow responses
         #
-        if self.server.component_enabled.slow_response:
+        if slow_response_enabled and self.slow_threshold:
 
             if self.processing_time > self.slow_threshold:
+
+                raw_request = self.request.raw_request
+                if not raw_request:
+                    req = ''
+                else:
+                    req = raw_request if isinstance(raw_request, basestring) else repr(raw_request)
 
                 data = {
                     'cid': self.cid,
@@ -732,7 +760,7 @@ class Service(object):
                     'slow_threshold': self.slow_threshold,
                     'req_ts': self.invocation_time.isoformat(),
                     'resp_ts': self.handle_return_time.isoformat(),
-                    'req': self.request.raw_request or '',
+                    'req': req,
                     'resp':_get_response_value(self.response), # TODO: Don't parse it here and a moment earlier above
                 }
                 slow_response.store(self.kvdb, self.name, **data)
@@ -744,7 +772,7 @@ class Service(object):
         """ The only method Zato services need to implement in order to process
         incoming requests.
         """
-        raise NotImplementedError('Should be overridden by subclasses')
+        raise NotImplementedError('Should be overridden by subclasses (Service.handle)')
 
     def lock(self, name=None, *args, **kwargs):#ttl=20, block=10):
         """ Creates a distributed lock.
@@ -933,7 +961,7 @@ class Service(object):
         if channel_type == _AMQP:
             service.request.amqp = AMQPRequestData(channel_item['amqp_msg'])
         elif channel_type == _WMQ:
-            service.request.wmq = WebSphereMQRequestData(wmq_ctx)
+            service.request.wmq = service.request.ibm_mq = IBMMQRequestData(wmq_ctx)
 
         service.channel = service.chan = ChannelInfo(
             channel_item.get('id'), channel_item.get('name'), channel_type,
