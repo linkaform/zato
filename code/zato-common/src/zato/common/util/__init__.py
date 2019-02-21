@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Copyright (C) 2019, Zato Source s.r.o. https://zato.io
+Copyright (C) 2018, Zato Source s.r.o. https://zato.io
 
 Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 """
@@ -27,15 +27,14 @@ import socket
 import sys
 import unicodedata
 from ast import literal_eval
-from base64 import b64decode
-from binascii import hexlify
 from contextlib import closing
+from cStringIO import StringIO
 from datetime import datetime, timedelta
 from glob import glob
 from hashlib import sha256
-from inspect import isfunction, ismethod
-from itertools import tee
-from io import StringIO
+from importlib import import_module
+from inspect import ismethod
+from itertools import ifilter, izip, izip_longest, tee
 from operator import itemgetter
 from os import getuid
 from os.path import abspath, isabs, join
@@ -48,6 +47,7 @@ from tempfile import NamedTemporaryFile
 from threading import current_thread
 from time import sleep
 from traceback import format_exc
+from urlparse import urlparse
 
 # alembic
 from alembic import op
@@ -90,28 +90,21 @@ import pytz
 # requests
 import requests
 
+# Spring Python
+from springpython.context import ApplicationContext
+from springpython.remoting.http import CAValidatingHTTPSConnection
+from springpython.remoting.xmlrpc import SSLClientTransport
+
 # SQLAlchemy
 import sqlalchemy as sa
 from sqlalchemy import orm
+from sqlalchemy.pool import NullPool
 
 # Texttable
 from texttable import Texttable
 
 # validate
 from validate import is_boolean, is_integer, VdtTypeError
-
-# Python 2/3 compatibility
-from builtins import bytes
-from future.moves.itertools import zip_longest
-from future.utils import iteritems, raise_
-from past.builtins import basestring, cmp, reduce, unicode
-from six import PY3
-from six.moves.urllib.parse import urlparse
-from zato.common.py23_ import ifilter, izip
-from zato.common.py23_.spring_ import CAValidatingHTTPSConnection, SSLClientTransport
-
-if PY3:
-    from functools import cmp_to_key
 
 # Zato
 from zato.common import CHANNEL, CLI_ARG_SEP, DATA_FORMAT, engine_def, engine_def_sqlite, KVDB, MISC, \
@@ -142,23 +135,10 @@ numpy_seed()
 
 # ################################################################################################################################
 
-# We can initialize it once per process here
-_hostname = socket.gethostname()
-_fqdn = socket.getfqdn()
-_current_host = '{}/{}'.format(_hostname, _fqdn)
-_current_user = getpwuid(getuid()).pw_name
-
-# ################################################################################################################################
-
 TLS_KEY_TYPE = {
     crypto.TYPE_DSA: 'DSA',
     crypto.TYPE_RSA: 'RSA'
 }
-
-# ################################################################################################################################
-
-def is_method(class_, func=isfunction if PY3 else ismethod):
-    return func(class_)
 
 # ################################################################################################################################
 
@@ -216,7 +196,7 @@ def absolutize(path, base=''):
 # ################################################################################################################################
 
 def current_host():
-    return _current_host
+    return socket.gethostname() + '/' + socket.getfqdn()
 
 # ################################################################################################################################
 
@@ -313,7 +293,7 @@ def make_repr(_object, ignore_double_underscore=True, to_avoid_list='repr_to_avo
     for attr in attrs:
         attr_obj = getattr(_object, attr)
         if not callable(attr_obj):
-            buff.write('; %s:%r' % (attr, attr_obj))
+            buff.write('; %s:`%r`' % (attr, attr_obj))
 
     out = _repr_template.safe_substitute(
         class_name=_object.__class__.__name__, mem_loc=hex(id(_object)), attrs=buff.getvalue())
@@ -342,8 +322,10 @@ def get_lb_client(lb_host, lb_agent_port, ssl_ca_certs, ssl_key_file, ssl_cert_f
     """
     from zato.agent.load_balancer.client import LoadBalancerAgentClient
 
-    agent_uri = 'https://{host}:{port}/RPC2'.format(host=lb_host, port=lb_agent_port)
+    agent_uri = "https://{host}:{port}/RPC2".format(host=lb_host, port=lb_agent_port)
 
+    # See the 'Problems with XML-RPC over SSL' thread for details
+    # https://lists.springsource.com/archives/springpython-users/2011-June/000480.html
     if sys.version_info >= (2, 7):
         class Python27CompatTransport(SSLClientTransport):
             def make_connection(self, host):
@@ -365,14 +347,14 @@ def tech_account_password(password_clear, salt):
 
 # ################################################################################################################################
 
-def new_cid(bytes=12, _random_bytes=random_bytes, _hexlify=hexlify):
+def new_cid(bytes=12, random_bytes=random_bytes):
     """ Returns a new 96-bit correlation identifier. It's *not* safe to use the ID
     for any cryptographical purposes, it's only meant to be used as a conveniently
     formatted ticket attached to each of the requests processed by Zato servers.
     Changed in 2.0: The number is now 28 characters long not 40, like in previous versions.
     Changed in 3.0: The number is now 96 bits rather than 128, 24 characters, with no constant prefix.
     """
-    return _hexlify(_random_bytes(bytes)).decode('utf8')
+    return random_bytes(12).encode('hex')
 
 # ################################################################################################################################
 
@@ -420,8 +402,20 @@ def _get_ioc_config(location, config_class):
 
 # ################################################################################################################################
 
+def get_app_context(config):
+    """ Returns the Zato's Inversion of Control application context.
+    """
+    ctx_class_path = config['spring']['context_class']
+    ctx_class_path = ctx_class_path.split('.')
+    mod_name, class_name = '.'.join(ctx_class_path[:-1]), ctx_class_path[-1:][0]
+    mod = import_module(mod_name)
+    class_ = getattr(mod, class_name)()
+    return ApplicationContext(class_)
+
+# ################################################################################################################################
+
 def get_current_user():
-    return _current_user
+    return getpwuid(getuid()).pw_name
 
 # ################################################################################################################################
 
@@ -442,7 +436,7 @@ def deployment_info(method, object_, timestamp, fs_location, remote_host='', rem
         'object': object_,
         'timestamp': timestamp,
         'fs_location':fs_location,
-        'remote_host': remote_host or os.environ.get('SSH_CONNECTION', ''),
+        'remote_host': remote_host,
         'remote_user': remote_user,
         'current_host': current_host(),
         'current_user': get_current_user(),
@@ -490,7 +484,6 @@ def payload_from_request(cid, request, data_format, transport):
                 return ''
             if isinstance(request, basestring) and data_format == DATA_FORMAT.JSON:
                 try:
-                    request = request.decode('utf8') if isinstance(request, bytes) else request
                     payload = loads(request)
                 except ValueError:
                     logger.warn('Could not parse request as JSON:`{}`, e:`{}`'.format(request, format_exc()))
@@ -636,11 +629,7 @@ def multikeysort(items, columns):
                 return mult * result
         else:
             return 0
-
-    if PY3:
-        return sorted(items, key=cmp_to_key(comparer))
-    else:
-        return sorted(items, cmp=comparer)
+    return sorted(items, cmp=comparer)
 
 # ################################################################################################################################
 
@@ -648,7 +637,7 @@ def multikeysort(items, columns):
 def grouper(n, iterable, fillvalue=None):
     "grouper(3, 'ABCDEFG', 'x') --> ABC DEF Gxx"
     args = [iter(iterable)] * n
-    return zip_longest(fillvalue=fillvalue, *args)
+    return izip_longest(fillvalue=fillvalue, *args)
 
 # ################################################################################################################################
 
@@ -799,8 +788,7 @@ def add_startup_jobs(cluster_id, odb, jobs, stats_enabled):
                         extra = dumps(extra)
 
                 if extra:
-                    if not isinstance(extra, bytes):
-                        extra = extra.encode('utf8')
+                    extra = extra.encode('utf8')
 
                 service = session.query(Service).\
                     filter(Service.name==item['service']).\
@@ -928,7 +916,7 @@ def get_threads_traceback(pid):
     result = {}
     id_name = dict([(th.ident, th.name) for th in threading.enumerate()])
 
-    for thread_id, frame in iteritems(sys._current_frames()):
+    for thread_id, frame in sys._current_frames().items():
         key = '{}:{}'.format(pid, id_name.get(thread_id, '(No name)'))
         result[key] = get_stack(frame, True)
 
@@ -960,8 +948,8 @@ def dump_stacks(*ignored):
 
     rows = [['Proc:Thread/Greenlet', 'Traceback']]
 
-    rows.extend(sorted(iteritems(get_threads_traceback(pid))))
-    rows.extend(sorted(iteritems(get_greenlets_traceback(pid))))
+    rows.extend(sorted(get_threads_traceback(pid).items()))
+    rows.extend(sorted(get_greenlets_traceback(pid).items()))
 
     table.add_rows(rows)
     logger.info('\n' + table.draw())
@@ -974,15 +962,13 @@ def get_full_stack():
     stack = traceback.extract_stack()[:-1]  # last one would be full_stack()
     if exc is not None:  # i.e. if an exception is present
         del stack[-1]    # remove call of full_stack, the printed exception will contain the caught exception caller instead
-    trace = 'Traceback (most recent call last):\n'
-    stack_string = trace + ''.join(traceback.format_list(stack))
+    trc = 'Traceback (most recent call last):\n'
+    stackstr = trc + ''.join(traceback.format_list(stack))
 
     if exc is not None:
-        stack_string += '  '
-        stack_string += traceback.format_exc()
-        stack_string = stack_string.lstrip(trace)
+        stackstr += '  ' + traceback.format_exc().decode('utf-8').lstrip(trc)
 
-    return stack_string
+    return stackstr
 
 # ################################################################################################################################
 
@@ -1157,7 +1143,7 @@ def validate_tls_from_payload(payload, is_key=False):
         pem = open(tf.name).read()
 
         cert_info = crypto.load_certificate(crypto.FILETYPE_PEM, pem)
-        cert_info = sorted(dict(iteritems(cert_info.get_subject().get_components())))
+        cert_info = sorted(dict(cert_info.get_subject().get_components()).items())
         cert_info = '; '.join('{}={}'.format(k, v) for k, v in cert_info)
 
         if is_key:
@@ -1229,7 +1215,7 @@ def replace_private_key(orig_payload):
 def delete_tls_material_from_fs(server, info, full_path_func):
     try:
         os.remove(full_path_func(server.tls_dir, info))
-    except OSError as e:
+    except OSError, e:
         if e.errno == errno.ENOENT:
             # It's ok - some other worker must have deleted it already
             pass
@@ -1312,7 +1298,7 @@ def get_basic_auth_credentials(auth):
         return None, None
 
     _, auth = auth.split(prefix)
-    auth = b64decode(auth.strip())
+    auth = auth.strip().decode('base64')
 
     return auth.split(':', 1)
 
@@ -1362,6 +1348,11 @@ def get_engine(args):
 
 # ################################################################################################################################
 
+def get_engine_lkf(args):
+    return sa.create_engine(get_engine_url(args), poolclass=NullPool)
+
+# ################################################################################################################################
+
 def get_session(engine):
     session = orm.sessionmaker() # noqa
     session.configure(bind=engine)
@@ -1395,6 +1386,25 @@ def get_odb_session_from_server_config(config, cm, odb_password_encrypted):
         engine_args.odb_password = config.odb.password
 
     return get_session(get_engine(engine_args))
+
+# ################################################################################################################################
+
+def get_odb_session_from_server_lkf(config, cm, odb_password_encrypted):
+
+    engine_args = Bunch()
+    engine_args.odb_type = config.odb.engine
+    engine_args.odb_user = config.odb.username
+    engine_args.odb_host = config.odb.host
+    engine_args.odb_port = config.odb.port
+    engine_args.odb_db_name = config.odb.db_name
+
+    if odb_password_encrypted:
+        engine_args.odb_password = cm.decrypt(config.odb.password) if config.odb.password else ''
+    else:
+        engine_args.odb_password = config.odb.password
+
+    return get_session(get_engine_lkf(engine_args))
+
 
 # ################################################################################################################################
 
@@ -1514,9 +1524,9 @@ def startup_service_payload_from_path(name, value, repo_location):
 
     try:
         payload = open(path).read()
-    except Exception:
+    except Exception, e:
         logger.warn(
-            'Could not open payload path:`%s` `%s`, skipping startup service:`%s`, e:`%s`', orig_path, path, name, format_exc())
+            'Could not open payload path:`%s` `%s`, skipping startup service:`%s`, e:`%s`', orig_path, path, name, format_exc(e))
     else:
         return payload
 
@@ -1529,7 +1539,7 @@ def invoke_startup_services(source, key, fs_server_config, repo_location, broker
     also possible that other workers are already running. In short, there is no guarantee that any server or worker in particular
     will receive the requests, only that there will be exactly one.
     """
-    for name, payload in iteritems(fs_server_config.get(key, {})):
+    for name, payload in fs_server_config.get(key, {}).items():
 
         # Don't invoke SSO services if the feature is not enabled
         if not is_sso_enabled:
@@ -1601,14 +1611,13 @@ def spawn_greenlet(callable, *args, **kwargs):
     because if it does, it means that there were some errors.
     """
     try:
-        timeout = kwargs.pop('timeout', 0.2)
         g = spawn(callable, *args, **kwargs)
         gevent_sleep(0)
-        g.join(timeout)
+        g.join(kwargs.pop('timeout', 0.2))
 
         if g.exception:
             type_, value, traceback = g.exc_info
-            raise_(type_(value), None, traceback)
+            raise type_(value), None, traceback
 
     except Timeout:
         pass # Timeout = good = no errors
@@ -1721,8 +1730,8 @@ def is_func_overridden(func):
     whether users implemented a given hook. If there is a special internal marker in input arguments,
     it means that it is an internal function from parent class, not a user-defined one.
     """
-    if func and is_method(func):
-        func_defaults = func.__defaults__ if PY3 else func.im_func.func_defaults
+    if func and ismethod(func):
+        func_defaults = func.im_func.func_defaults
 
         # Only internally defined methods will fulfill conditions that they have default arguments
         # and one of them is our no-op marker, hence if we negate it and the result is True,
