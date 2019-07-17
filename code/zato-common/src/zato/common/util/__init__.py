@@ -38,7 +38,6 @@ from itertools import ifilter, izip, izip_longest, tee
 from operator import itemgetter
 from os import getuid
 from os.path import abspath, isabs, join
-from platform import system as platform_system
 from pprint import pprint as _pprint, PrettyPrinter
 from pwd import getpwuid
 from string import Template
@@ -113,6 +112,7 @@ from zato.common import CHANNEL, CLI_ARG_SEP, DATA_FORMAT, engine_def, engine_de
 from zato.common.broker_message import SERVICE
 from zato.common.crypto import CryptoManager
 from zato.common.odb.model import Cluster, HTTPBasicAuth, HTTPSOAP, IntervalBasedJob, Job, Server, Service
+from zato.common.util.tcp import get_free_port, is_port_taken, wait_until_port_free, wait_until_port_taken
 
 # ################################################################################################################################
 
@@ -130,6 +130,14 @@ cid_base = len(cid_symbols)
 
 # ################################################################################################################################
 
+# Kept here for backward compatibility
+get_free_port = get_free_port
+is_port_taken = is_port_taken
+wait_until_port_free = wait_until_port_free
+wait_until_port_taken = wait_until_port_taken
+
+# ################################################################################################################################
+
 # This reseeds the current process only and each parallel server does it for each subprocess too.
 numpy_seed()
 
@@ -144,7 +152,7 @@ TLS_KEY_TYPE = {
 
 # (c) 2005 Ian Bicking and contributors; written for Paste (http://pythonpaste.org)
 # Licensed under the MIT license: http://www.opensource.org/licenses/mit-license.php
-def asbool(obj):
+def as_bool(obj):
     if isinstance(obj, (str, unicode)):
         obj = obj.strip().lower()
         if obj in ['true', 'yes', 'on', 'y', 't', '1']:
@@ -156,7 +164,7 @@ def asbool(obj):
                 "String is not true/false: %r" % obj)
     return bool(obj)
 
-def aslist(obj, sep=None, strip=True):
+def as_list(obj, sep=None, strip=True):
     if isinstance(obj, (str, unicode)):
         lst = obj.split(sep)
         if strip:
@@ -168,6 +176,9 @@ def aslist(obj, sep=None, strip=True):
         return []
     else:
         return [obj]
+
+asbool = as_bool
+aslist = as_list
 
 # ################################################################################################################################
 
@@ -183,7 +194,7 @@ def absjoin(base, path):
 # ################################################################################################################################
 
 def absolutize(path, base=''):
-    """ Turns a relative path to an absolute one or returns it as is if it's already absolute.
+    """ Turns a relative path into an absolute one or returns it as is if it's already absolute.
     """
     if not isabs(path):
         path = os.path.expanduser(path)
@@ -317,28 +328,30 @@ def to_form(_object):
 
 # ################################################################################################################################
 
-def get_lb_client(lb_host, lb_agent_port, ssl_ca_certs, ssl_key_file, ssl_cert_file, timeout):
+def get_lb_client(is_tls_enabled, lb_host, lb_agent_port, ssl_ca_certs, ssl_key_file, ssl_cert_file, timeout):
     """ Returns an SSL XML-RPC client to the load-balancer.
     """
-    from zato.agent.load_balancer.client import LoadBalancerAgentClient
+    from zato.agent.load_balancer.client import LoadBalancerAgentClient, TLSLoadBalancerAgentClient
 
-    agent_uri = "https://{host}:{port}/RPC2".format(host=lb_host, port=lb_agent_port)
+    http_proto = 'https' if is_tls_enabled else 'http'
+    agent_uri = '{}://{}:{}/RPC2'.format(http_proto, lb_host, lb_agent_port)
 
-    # See the 'Problems with XML-RPC over SSL' thread for details
-    # https://lists.springsource.com/archives/springpython-users/2011-June/000480.html
-    if sys.version_info >= (2, 7):
-        class Python27CompatTransport(SSLClientTransport):
-            def make_connection(self, host):
-                return CAValidatingHTTPSConnection(
-                    host, strict=self.strict, ca_certs=self.ca_certs,
-                    keyfile=self.keyfile, certfile=self.certfile, cert_reqs=self.cert_reqs,
-                    ssl_version=self.ssl_version, timeout=self.timeout)
-        transport = Python27CompatTransport
+    if is_tls_enabled:
+        if sys.version_info >= (2, 7):
+            class Python27CompatTransport(SSLClientTransport):
+                def make_connection(self, host):
+                    return CAValidatingHTTPSConnection(
+                        host, strict=self.strict, ca_certs=self.ca_certs,
+                        keyfile=self.keyfile, certfile=self.certfile, cert_reqs=self.cert_reqs,
+                        ssl_version=self.ssl_version, timeout=self.timeout)
+            transport = Python27CompatTransport
+        else:
+            transport = None
+
+        return TLSLoadBalancerAgentClient(
+            agent_uri, ssl_ca_certs, ssl_key_file, ssl_cert_file, transport=transport, timeout=timeout)
     else:
-        transport = None
-
-    return LoadBalancerAgentClient(
-        agent_uri, ssl_ca_certs, ssl_key_file, ssl_cert_file, transport=transport, timeout=timeout)
+        return LoadBalancerAgentClient(agent_uri)
 
 # ################################################################################################################################
 
@@ -979,6 +992,31 @@ def register_diag_handlers():
 
 # ################################################################################################################################
 
+def parse_simple_type(value, convert_bool=True):
+    if convert_bool:
+        try:
+            value = is_boolean(value)
+        except VdtTypeError:
+            # It's cool, not a boolean
+            pass
+
+    try:
+        value = is_integer(value)
+    except VdtTypeError:
+        # OK, not an integer
+        pass
+
+    # Could be a dict or another simple type then
+    try:
+        value = literal_eval(value)
+    except Exception:
+        pass
+
+    # Either parsed out or as it was received
+    return value
+
+# ################################################################################################################################
+
 def parse_extra_into_dict(lines, convert_bool=True):
     """ Creates a dictionary out of key=value lines.
     """
@@ -990,31 +1028,18 @@ def parse_extra_into_dict(lines, convert_bool=True):
         for line in extra.split(';'):
             original_line = line
             if line:
+
+                line = line.strip()
+                if line.startswith('#'):
+                    continue
+
                 line = line.split('=', 1)
                 if not len(line) == 2:
                     raise ValueError('Each line must be a single key=value entry, not `{}`'.format(original_line))
 
                 key, value = line
                 value = value.strip()
-
-                if convert_bool:
-                    try:
-                        value = is_boolean(value)
-                    except VdtTypeError:
-                        # It's cool, not a boolean
-                        pass
-
-                try:
-                    value = is_integer(value)
-                except VdtTypeError:
-                    # OK, not an integer
-                    pass
-
-                # Could be a dict or another simple type then
-                try:
-                    value = literal_eval(value)
-                except Exception:
-                    pass
+                value = parse_simple_type(value, convert_bool)
 
                 # OK, let's just treat it as string
                 _extra[key.strip()] = value
@@ -1041,68 +1066,6 @@ def validate_xpath(expr):
     """
     etree.XPath(expr)
     return True
-
-# ################################################################################################################################
-
-def get_free_port(start=30000):
-    port = start
-    while is_port_taken(port):
-        port += 1
-    return port
-
-# ################################################################################################################################
-
-# Taken from http://grodola.blogspot.com/2014/04/reimplementing-netstat-in-cpython.html
-def is_port_taken(port, is_linux=platform_system().lower()=='linux'):
-    # Short for Linux so as not to bind to a socket which in turn means waiting until it's closed by OS
-    if is_linux:
-        for conn in psutil.net_connections(kind='tcp'):
-            if conn.laddr[1] == port and conn.status == psutil.CONN_LISTEN:
-                return True
-    else:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        try:
-            sock.bind(('', port))
-            sock.close()
-        except socket.error as e:
-            if e[0] == errno.EADDRINUSE:
-                return True
-            raise
-
-# ################################################################################################################################
-
-def _is_port_ready(port, needs_taken):
-    taken = is_port_taken(port)
-    return taken if needs_taken else not taken
-
-def _wait_for_port(port, timeout, interval, needs_taken):
-    port_ready = _is_port_ready(port, needs_taken)
-
-    if not port_ready:
-        start = datetime.utcnow()
-        wait_until = start + timedelta(seconds=timeout)
-
-        while not port_ready:
-            sleep(interval)
-            port_ready = _is_port_ready(port, needs_taken)
-            if datetime.utcnow() > wait_until:
-                break
-
-    return port_ready
-
-# ################################################################################################################################
-
-def wait_until_port_taken(port, timeout=2, interval=0.1):
-    """ Waits until a given TCP port becomes taken, i.e. a process binds to a TCP socket.
-    """
-    return _wait_for_port(port, timeout, interval, True)
-
-# ################################################################################################################################
-
-def wait_until_port_free(port, timeout=2, interval=0.1):
-    """ Waits until a given TCP port becomes free, i.e. a process releases a TCP socket.
-    """
-    return _wait_for_port(port, timeout, interval, False)
 
 # ################################################################################################################################
 

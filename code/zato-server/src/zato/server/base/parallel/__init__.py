@@ -37,13 +37,14 @@ from paste.util.converters import asbool
 from zato.broker import BrokerMessageReceiver
 from zato.broker.client import BrokerClient
 from zato.bunch import Bunch
-from zato.common import DATA_FORMAT, default_internal_modules, KVDB, SECRETS, SERVER_STARTUP, SERVER_UP_STATUS, \
+from zato.common import DATA_FORMAT, default_internal_modules, KVDB, RATE_LIMIT, SECRETS, SERVER_STARTUP, SERVER_UP_STATUS, \
      ZATO_ODB_POOL_NAME
 from zato.common.audit import audit_pii
 from zato.common.broker_message import HOT_DEPLOY, MESSAGE_TYPE, TOPICS
 from zato.common.ipc.api import IPCAPI
 from zato.common.zato_keyutils import KeyUtils
 from zato.common.pubsub import SkipDelivery
+from zato.common.rate_limiting import RateLimiting
 from zato.common.util import absolutize, get_config, get_kvdb_config_for_log, get_user_config_name, hot_deploy, \
      invoke_startup_services as _invoke_startup_services, new_cid, spawn_greenlet, StaticConfig, \
      register_diag_handlers
@@ -55,28 +56,49 @@ from zato.server.config import ConfigStore
 from zato.server.connection.server import Servers
 from zato.server.base.parallel.config import ConfigLoader
 from zato.server.base.parallel.http import HTTPHandler
-from zato.server.base.parallel.wmq import WMQIPC
+from zato.server.base.parallel.subprocess_.ibm_mq import IBMMQIPC
+from zato.server.base.parallel.subprocess_.sftp import SFTPIPC
 from zato.server.pickup import PickupManager
+
+# ################################################################################################################################
+
+# Type checking
+import typing
+
+if typing.TYPE_CHECKING:
+
+    # Zato
+    from zato.common.odb.api import ODBManager
+    from zato.server.service.store import ServiceStore
+    from zato.sso.api import SSOAPI
+
+    # For pyflakes
+    ODBManager = ODBManager
+    ServiceStore = ServiceStore
+    SSOAPI = SSOAPI
 
 # ################################################################################################################################
 
 logger = logging.getLogger(__name__)
 kvdb_logger = logging.getLogger('zato_kvdb')
 
+# ################################################################################################################################
+
 megabyte = 10**6
 
 # ################################################################################################################################
+# ################################################################################################################################
 
-class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
+class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler):
     """ Main server process.
     """
     def __init__(self):
         self.host = None
         self.port = None
         self.crypto_manager = None
-        self.odb = None
+        self.odb = None # type: ODBManager
         self.odb_data = None
-        self.config = None
+        self.config = None # type: ConfigStore
         self.repo_location = None
         self.user_conf_location = None
         self.sql_pool_store = None
@@ -86,28 +108,30 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
         self.json_content_type = None
         self.service_modules = None # Set programmatically in Spring
         self.service_sources = None # Set in a config file
-        self.base_dir = None
-        self.tls_dir = None
-        self.static_dir = None
-        self.hot_deploy_config = None
+        self.base_dir = None        # type: unicode
+        self.tls_dir = None         # type: unicode
+        self.static_dir = None      # type: unicode
+        self.json_schema_dir = None # type: unicode
+        self.hot_deploy_config = None # type: Bunch
         self.pickup = None
-        self.fs_server_config = None
-        self.fs_sql_config = None
-        self.pickup_config = None
-        self.logging_config = None
-        self.logging_conf_path = None
-        self.sio_config = None
-        self.sso_config = None
+        self.fs_server_config = None # type: Bunch
+        self.fs_sql_config = None # type: Bunch
+        self.pickup_config = None # type: Bunch
+        self.logging_config = None # type: Bunch
+        self.logging_conf_path = None # type: unicode
+        self.sio_config = None # type: Bunch
+        self.sso_config = None # type: Bunch
         self.connector_server_grace_time = None
-        self.id = None
-        self.name = None
-        self.worker_id = None
-        self.worker_pid = None
+        self.id = None # type: int
+        self.name = None # type: unicode
+        self.worker_id = None # type: int
+        self.worker_pid = None # type: int
         self.cluster = None
-        self.cluster_id = None
+        self.cluster_id = None # type: int
         self.kvdb = None
         self.startup_jobs = None
-        self.worker_store = None
+        self.worker_store = None # type: WorkerStore
+        self.service_store = None # type: ServiceStore
         self.request_dispatcher_dispatch = None
         self.deployment_lock_expires = None
         self.deployment_lock_timeout = None
@@ -117,29 +141,31 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
         self.static_config = None
         self.component_enabled = Bunch()
         self.client_address_headers = ['HTTP_X_ZATO_FORWARDED_FOR', 'HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR']
-        self.broker_client = None
-        self.return_tracebacks = None
-        self.default_error_message = None
-        self.time_util = None
-        self.preferred_address = None
-        self.crypto_use_tls = None
-        self.servers = None
-        self.zato_lock_manager = None
-        self.pid = None
-        self.sync_internal = None
+        self.broker_client = None # type: BrokerClient
+        self.return_tracebacks = None # type: bool
+        self.default_error_message = None # type: unicode
+        self.time_util = None # type: TimeUtil
+        self.preferred_address = None # type: unicode
+        self.crypto_use_tls = None # type: bool
+        self.servers = None # type: Servers
+        self.zato_lock_manager = None # type: LockManager
+        self.pid = None # type: int
+        self.sync_internal = None # type: bool
         self.ipc_api = IPCAPI()
-        self.wmq_ipc_tcp_port = None
-        self.fifo_response_buffer_size = None # Will be in megabytes
-        self.is_first_worker = None
+        self.fifo_response_buffer_size = None # type: int # Will be in megabytes
+        self.is_first_worker = None # type: bool
         self.shmem_size = -1.0
         self.server_startup_ipc = ServerStartupIPC()
         self.connector_config_ipc = ConnectorConfigIPC()
         self.keyutils = KeyUtils()
-        self.sso_api = None
+        self.sso_api = None # type: SSOAPI
         self.is_sso_enabled = False
         self.audit_pii = audit_pii
+        self.has_fg = False
         self.startup_callable_tool = None
         self.default_internal_pubsub_endpoint_id = None
+        self.rate_limiting = None # type: RateLimiting
+        self.jwt_secret = None # type: bytes
         self._hash_secret_method = None
         self._hash_secret_rounds = None
         self._hash_secret_salt_size = None
@@ -152,11 +178,24 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
         self.user_ctx = Bunch()
         self.user_ctx_lock = gevent.lock.RLock()
 
+        # Connectors
+        self.connector_ibm_mq = IBMMQIPC(self)
+        self.connector_sftp   = SFTPIPC(self)
+
+        # HTTP methods allowed as a Python list
+        self.http_methods_allowed = []
+
+        # As above, but as a regular expression pattern
+        self.http_methods_allowed_re = ''
+
         self.access_logger = logging.getLogger('zato_access_log')
         self.access_logger_log = self.access_logger._log
         self.needs_access_log = self.access_logger.isEnabledFor(INFO)
+        self.needs_all_access_log = True
+        self.access_log_ignore = set()
         self.has_pubsub_audit_log = logging.getLogger('zato_pubsub_audit').isEnabledFor(INFO)
         self.is_enabled_for_warn = logging.getLogger('zato').isEnabledFor(WARN)
+        self.is_admin_enabled_for_info = logging.getLogger('zato_admin').isEnabledFor(INFO)
 
         # The main config store
         self.config = ConfigStore()
@@ -179,7 +218,7 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
 
         if other_servers:
             other_server = other_servers[0] # Index 0 is as random as any other because the list is not sorted.
-            missing = self.odb.get_missing_services(other_server, locally_deployed)
+            missing = self.odb.get_missing_services(other_server, set(item.name for item in locally_deployed))
 
             if missing:
 
@@ -381,7 +420,7 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
         self.config.odb_data['fs_sql_config'] = self.fs_sql_config
         self.sql_pool_store[ZATO_ODB_POOL_NAME] = self.config.odb_data
         self.odb.pool = self.sql_pool_store[ZATO_ODB_POOL_NAME].pool
-        self.odb.token = self.config.odb_data.token
+        self.odb.token = self.config.odb_data.token.decode('utf8')
         self.odb.decrypt_func = self.decrypt
 
 # ################################################################################################################################
@@ -390,7 +429,7 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
     def start_server(parallel_server, zato_deployment_key=None):
 
         # Easier to type
-        self = parallel_server
+        self = parallel_server # type: ParallelServer
 
         # This cannot be done in __init__ because each sub-process obviously has its own PID
         self.pid = os.getpid()
@@ -451,6 +490,15 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
                     self.cluster.name, self.pid, 's' if use_tls else '', self.preferred_address,
             self.port)
 
+        # Configure which HTTP methods can be invoked via REST or SOAP channels
+        methods_allowed = self.fs_server_config.http.methods_allowed
+        methods_allowed = methods_allowed if isinstance(methods_allowed, list) else [methods_allowed]
+        self.http_methods_allowed.extend(methods_allowed)
+
+        # As above, as a regular expression to be used in pattern matching
+        http_methods_allowed_re = '|'.join(self.http_methods_allowed)
+        self.http_methods_allowed_re = '({})'.format(http_methods_allowed_re)
+
         # Reads in all configuration from ODB
         self.worker_store = WorkerStore(self.config, self)
         self.worker_store.invoke_matcher.read_config(self.fs_server_config.invoke_patterns_allowed)
@@ -459,6 +507,8 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
 
         # Normalize hot-deploy configuration
         self.hot_deploy_config = Bunch()
+
+        self.hot_deploy_config.pickup_dir = absolutize(self.fs_server_config.hot_deploy.pickup_dir, self.repo_location)
 
         self.hot_deploy_config.work_dir = os.path.normpath(os.path.join(
             self.repo_location, self.fs_server_config.hot_deploy.work_dir))
@@ -474,6 +524,20 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
 
         # Finally, assign it to ServiceStore
         self.service_store.max_batch_size = max_batch_size
+
+        # Rate limiting
+        self.rate_limiting = RateLimiting()
+        self.rate_limiting.cluster_id = self.cluster_id
+        self.rate_limiting.global_lock_func = self.zato_lock_manager
+        self.rate_limiting.sql_session_func = self.odb.session
+
+        # Set up rate limiting for ConfigDict-based objects, which includes everything except for:
+        # * services  - configured in ServiceStore
+        # * SSO       - configured in the next call
+        self.set_up_rate_limiting()
+
+        # Rate limiting for SSO
+        self.set_up_sso_rate_limiting()
 
         # Deploys services
         is_first, locally_deployed = self._after_init_common(server)
@@ -557,20 +621,25 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
             self.invoke_startup_services(is_first)
             spawn_greenlet(self.set_up_pickup)
 
-            # Set up IBM MQ connections if that component is enabled
+            # Set up subprocess-based IBM MQ connections if that component is enabled
             if self.fs_server_config.component_enabled.ibm_mq:
 
                 # Will block for a few seconds at most, until is_ok is returned
                 # which indicates that a connector started or not.
-                is_ok = self.start_ibm_mq_connector(int(self.fs_server_config.ibm_mq.ipc_tcp_start_port))
+                is_ok = self.connector_ibm_mq.start_ibm_mq_connector(int(self.fs_server_config.ibm_mq.ipc_tcp_start_port))
 
                 try:
                     if is_ok:
-                        self.create_initial_wmq_definitions(self.worker_store.worker_config.definition_wmq)
-                        self.create_initial_wmq_outconns(self.worker_store.worker_config.out_wmq)
-                        self.create_initial_wmq_channels(self.worker_store.worker_config.channel_wmq)
+                        self.connector_ibm_mq.create_initial_wmq_definitions(self.worker_store.worker_config.definition_wmq)
+                        self.connector_ibm_mq.create_initial_wmq_outconns(self.worker_store.worker_config.out_wmq)
+                        self.connector_ibm_mq.create_initial_wmq_channels(self.worker_store.worker_config.channel_wmq)
                 except Exception as e:
                     logger.warn('Could not create initial IBM MQ objects, e:`%s`', e)
+
+            # Set up subprocess-based SFTP connections
+            is_ok = self.connector_sftp.start_sftp_connector(int(self.fs_server_config.ibm_mq.ipc_tcp_start_port))
+            if is_ok:
+                self.connector_sftp.create_initial_sftp_outconns(self.worker_store.worker_config.out_sftp)
 
         else:
             self.startup_callable_tool.invoke(SERVER_STARTUP.PHASE.IN_PROCESS_OTHER, kwargs={
@@ -588,6 +657,24 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
         })
 
         logger.info('Started `%s@%s` (pid: %s)', server.name, server.cluster.name, self.pid)
+
+# ################################################################################################################################
+
+    def set_up_sso_rate_limiting(self):
+        for item in self.odb.get_sso_user_rate_limiting_info():
+            self._create_sso_user_rate_limiting(item.user_id, True, item.rate_limit_def)
+
+# ################################################################################################################################
+
+    def _create_sso_user_rate_limiting(self, user_id, is_active, rate_limit_def, _type=RATE_LIMIT.OBJECT_TYPE.SSO_USER):
+        self.rate_limiting.create({
+            'id': user_id,
+            'type_': _type,
+            'name': user_id,
+            'is_active': is_active,
+            'parent_type': None,
+            'parent_name': None,
+        }, rate_limit_def, True)
 
 # ################################################################################################################################
 
@@ -613,13 +700,13 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
 
     def configure_sso(self):
         if self.is_sso_enabled:
-            self.sso_api.set_odb_session_func(self._get_sso_session)
+            self.sso_api.post_configure(self._get_sso_session, self.odb.is_sqlite)
 
 # ################################################################################################################################
 
     def invoke_startup_services(self, is_first):
         _invoke_startup_services('Parallel', 'startup_services_first_worker' if is_first else 'startup_services_any_worker',
-            self.fs_server_config, self.repo_location, self.broker_client, 'zato.notif.init-notifiers',
+            self.fs_server_config, self.repo_location, self.broker_client, None,
             is_sso_enabled=self.is_sso_enabled)
 
 # ################################################################################################################################
@@ -672,7 +759,7 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
 
         stanza = 'zato_internal_service_hot_deploy'
         stanza_config = Bunch({
-            'pickup_from': absolutize(self.fs_server_config.hot_deploy.pickup_dir, self.repo_location),
+            'pickup_from': self.hot_deploy_config.pickup_dir,
             'patterns': [globre.compile('*.py', globre.EXACT | IGNORECASE)],
             'read_on_pickup': False,
             'parse_on_pickup': False,
@@ -946,4 +1033,5 @@ class ParallelServer(BrokerMessageReceiver, ConfigLoader, HTTPHandler, WMQIPC):
         msg = {'action': HOT_DEPLOY.CREATE_SERVICE.value, 'package_id': package_id}
         self.broker_client.publish(msg)
 
+# ################################################################################################################################
 # ################################################################################################################################

@@ -44,11 +44,12 @@ class JWT(object):
 
 # ################################################################################################################################
 
-    def __init__(self, kvdb, odb, secret):
+    def __init__(self, kvdb, odb, decrypt_func, secret):
         self.odb = odb
         logger.info('ODB=' + str(odb))
         self.cache = RobustCache(kvdb, odb)
         logger.info('CACHE=' + str(self.cache))
+        self.decrypt_func = decrypt_func
 
         self.secret = secret
         logger.info('SECRET=' + str(secret))
@@ -59,7 +60,13 @@ class JWT(object):
 
     def _lookup_jwt(self, username, password):
         with closing(self.odb.session()) as session:
-            return session.query(JWT_).filter_by(username=username, password=password).first()
+            item = session.query(JWT_).\
+                filter(JWT_.username==username).\
+                first()
+
+            if item:
+                if self.decrypt_func(item.password) == password:
+                    return item
 
 # ################################################################################################################################
 
@@ -71,7 +78,7 @@ class JWT(object):
         token_data.update(data)
 
         token = jwt.encode(token_data, self.secret, algorithm=self.ALGORITHM)
-        return self.fernet.encrypt(token.encode('utf-8'))
+        return self.fernet.encrypt(token).decode('utf8')
 
 # ################################################################################################################################
 
@@ -104,7 +111,7 @@ class JWT(object):
         2.b If found:
             3. decrypt
             4. decode
-            5. renew the cache expiration asyncronouysly (do not wait for the update confirmation).
+            5. renew the cache expiration asynchronously (do not wait for the update confirmation).
             5. return "valid" + the token contents
         """
         logger.info('USERNAME=' + expected_username)

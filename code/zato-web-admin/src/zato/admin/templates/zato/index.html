@@ -145,6 +145,7 @@
                             <ul>
                                 <li class='wide'><a href="{% url "def-amqp" %}?cluster={{ cluster_id|default:'' }}">AMQP</a></li>
                                 <li class='wide'><a href="{% url "def-cassandra" %}?cluster={{ cluster_id|default:'' }}">Cassandra</a></li>
+                                <li class='wide'><a href="{% url "definition-kafka" %}?cluster={{ cluster_id|default:'' }}&amp;type_=def-kafka">Kafka</a></li>
                                 <li class='wide'><a href="{% url "definition-wmq" %}?cluster={{ cluster_id|default:'' }}">IBM MQ</a></li>
                             </ul>
                         </li>
@@ -153,6 +154,7 @@
                             <ul>
                                 <li class='wide'><a href="{% url "channel-amqp" %}?cluster={{ cluster_id|default:'' }}">AMQP</a></li>
                                 <li class='wide'><a href="{% url "channel-jms-wmq" %}?cluster={{ cluster_id|default:'' }}">IBM MQ</a></li>
+                                <li class='wide'><a href="{% url "channel-json-rpc" %}?cluster={{ cluster_id|default:'' }}">JSON-RPC</a></li>
                                 <li class='wide'><a href="{% url "http-soap" %}?cluster={{ cluster_id|default:'' }}&amp;connection=channel&amp;transport=plain_http">REST</a></li>
                                 <li class='wide'><a href="{% url "http-soap" %}?cluster={{ cluster_id|default:'' }}&amp;connection=channel&amp;transport=soap">SOAP</a></li>
                                 <!-- <li class='wide'><a href="{% url "channel-stomp" %}?cluster={{ cluster_id|default:'' }}">STOMP</a></li> -->
@@ -166,9 +168,12 @@
                                 <li class='wide'><a href="{% url "out-amqp" %}?cluster={{ cluster_id|default:'' }}">AMQP</a></li>
                                 <li class='wide'><a href="{% url "out-ftp" %}?cluster={{ cluster_id|default:'' }}">FTP</a></li>
                                 <li class='wide'><a href="{% url "out-jms-wmq" %}?cluster={{ cluster_id|default:'' }}">IBM MQ</a></li>
+                                <li class='wide'><a href="{% url "out-ldap" %}?cluster={{ cluster_id|default:'' }}&amp;type_=outconn-ldap">LDAP</a></li>
+                                <li class='wide'><a href="{% url "out-mongodb" %}?cluster={{ cluster_id|default:'' }}&amp;type_=outconn-mongodb">MongoDB</a></li>
                                 <li class='wide'><a href="{% url "out-odoo" %}?cluster={{ cluster_id|default:'' }}">Odoo</a></li>
                                 <li class='wide'><a href="{% url "http-soap" %}?cluster={{ cluster_id|default:'' }}&amp;connection=outgoing&amp;transport=plain_http">REST</a></li>
                                 <li class='wide'><a href="{% url "out-sap" %}?cluster={{ cluster_id|default:'' }}">SAP RFC</a></li>
+                                <li class='wide'><a href="{% url "out-sftp" %}?cluster={{ cluster_id|default:'' }}&amp;type_=outconn-sftp">SFTP</a></li>
                                 <li class='wide'><a href="{% url "http-soap" %}?cluster={{ cluster_id|default:'' }}&amp;connection=outgoing&amp;transport=soap">SOAP</a></li>
                                 <li class='wide'><a href="{% url "out-sql" %}?cluster={{ cluster_id|default:'' }}">SQL</a></li>
                                 <li class='wide'><a href="{% url "out-wsx" %}?cluster={{ cluster_id|default:'' }}&amp;type_=outconn-wsx">WebSockets</a></li>
@@ -204,6 +209,13 @@
                             <span class="like-a">Queries &rarr;</span>
                             <ul>
                                 <li class='wide'><a href="{% url "query-cassandra" %}?cluster={{ cluster_id|default:'' }}">Cassandra</a></li>
+                            </ul>
+                        </li>
+                        <li>
+                            <span class="like-a">IM &rarr;</span>
+                            <ul>
+                                <li class='wide'><a href="{% url "out-im-slack" %}?cluster={{ cluster_id|default:'' }}&amp;type_=outconn-im-slack">Slack</a></li>
+                                <li class='wide'><a href="{% url "out-im-telegram" %}?cluster={{ cluster_id|default:'' }}&amp;type_=outconn-im-telegram">Telegram</a></li>
                             </ul>
                         </li>
                         <li>

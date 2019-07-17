@@ -30,6 +30,11 @@ from future.utils import iterkeys
 from past.builtins import basestring
 
 # Zato
+try:
+    from zato.admin.settings import lb_agent_use_tls
+except ImportError:
+    lb_agent_use_tls = True
+
 from zato.admin.settings import ssl_key_file, ssl_cert_file, ssl_ca_certs, LB_AGENT_CONNECT_TIMEOUT
 from zato.admin.web import from_utc_to_user
 from zato.common import SEC_DEF_TYPE_NAME, ZatoException, ZATO_NONE, ZATO_SEC_USE_RBAC
@@ -113,7 +118,7 @@ def get_lb_client(cluster):
     which may use web admin's SSL material (the client from zato.common can't use
     it because it would make it dependent on the zato.admin package).
     """
-    return _get_lb_client(cluster.lb_host, cluster.lb_agent_port, ssl_ca_certs,
+    return _get_lb_client(lb_agent_use_tls, cluster.lb_host, cluster.lb_agent_port, ssl_ca_certs,
                           ssl_key_file, ssl_cert_file, LB_AGENT_CONNECT_TIMEOUT)
 
 # ################################################################################################################################
@@ -182,7 +187,7 @@ def change_password(req, service_name, field1='password1', field2='password2', s
         req.zato.client.invoke(service_name, input_dict)
 
     except Exception:
-        msg = 'Password could not be changed, e:`{}`'.format(format_exc())
+        msg = 'Caught an exception, e:`{}`'.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
     else:
@@ -424,6 +429,8 @@ class Index(_BaseView):
 
             return_data = self.handle_return_data(return_data)
 
+            logger.info('Index data for frontend `%s`', return_data)
+
             return TemplateResponse(req, self.get_template_name() or self.template, return_data)
 
         except Exception:
@@ -438,7 +445,7 @@ class CreateEdit(_BaseView):
     """ Subclasses of this class will handle the creation/updates of Zato objects.
     """
 
-    def __init__(self):
+    def __init__(self, *args, **kwargs):
         super(CreateEdit, self).__init__()
         self.input = Bunch()
         self.input_dict = {}
@@ -469,11 +476,14 @@ class CreateEdit(_BaseView):
 
             self.input_dict.update(input_dict)
 
-            logger.debug(
-                'Request input dict `%r` out of `%r`, `%r`, `%r`, `%r`, `%r`', self.input_dict,
-                self.SimpleIO.input_required, self.SimpleIO.input_optional, self.input, self.req.GET, self.req.POST)
+            logger.info('Request self.input_dict %s', self.input_dict)
+            logger.info('Request self.SimpleIO.input_required %s', self.SimpleIO.input_required)
+            logger.info('Request self.SimpleIO.input_optional %s', self.SimpleIO.input_optional)
+            logger.info('Request self.input %s', self.input)
+            logger.info('Request self.req.GET %s', self.req.GET)
+            logger.info('Request self.req.POST %s', self.req.POST)
 
-            logger.debug('Sending `%s` to `%s`', self.input_dict, self.service_name)
+            logger.info('Sending `%s` to `%s`', self.input_dict, self.service_name)
 
             response = self.req.zato.client.invoke(self.service_name, self.input_dict)
 
@@ -496,7 +506,7 @@ class CreateEdit(_BaseView):
 
                 self.post_process_return_data(return_data)
 
-                logger.debug('CreateEdit data for frontend `%s`', return_data)
+                logger.info('CreateEdit data for frontend `%s`', return_data)
 
                 return HttpResponse(dumps(return_data), content_type='application/javascript')
             else:
@@ -590,6 +600,8 @@ def id_only_service(req, service, id, error_template='{}', initial=None):
         if initial:
             request.update(initial)
 
+        logger.info('Sending `%s` to `%s` (id_only_service)', request, service)
+
         result = req.zato.client.invoke(service, request)
 
         if not result.ok:
@@ -600,6 +612,14 @@ def id_only_service(req, service, id, error_template='{}', initial=None):
         msg = error_template.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
+
+# ################################################################################################################################
+
+def ping_connection(req, service, connection_id, connection_type='{}'):
+    ret = id_only_service(req, service, connection_id, 'Could not ping {}, e:`{{}}`'.format(connection_type))
+    if isinstance(ret, HttpResponseServerError):
+        return ret
+    return HttpResponse(ret.data.info)
 
 # ################################################################################################################################
 
@@ -632,5 +652,19 @@ def upload_to_server(req, cluster_id, service, error_msg_template):
         msg = error_msg_template.format(format_exc())
         logger.error(msg)
         return HttpResponseServerError(msg)
+
+# ################################################################################################################################
+
+def get_http_channel_security_id(item):
+    _security_id = item.security_id
+    if _security_id:
+        security_id = '{0}/{1}'.format(item.sec_type, _security_id)
+    else:
+        if item.sec_use_rbac:
+            security_id = ZATO_SEC_USE_RBAC
+        else:
+            security_id = ZATO_NONE
+
+    return security_id
 
 # ################################################################################################################################

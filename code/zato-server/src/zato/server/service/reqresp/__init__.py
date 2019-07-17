@@ -10,9 +10,11 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 import logging
+from cgi import FieldStorage
 from copy import deepcopy
 from http.client import OK
 from itertools import chain
+from io import BytesIO
 from traceback import format_exc
 
 # anyjson
@@ -58,20 +60,43 @@ direct_payload = simple_types + (EtreeElement, ObjectifiedElement)
 class HTTPRequestData(object):
     """ Data regarding an HTTP request.
     """
+    __slots__ = 'method', 'GET', 'POST', 'path', 'params', '_wsgi_environ'
+
     def __init__(self, _Bunch=Bunch):
         self.method = None
         self.GET = _Bunch()
         self.POST = _Bunch()
         self.path = None
         self.params = _Bunch()
+        self._wsgi_environ = None # type: dict
 
     def init(self, wsgi_environ=None):
-        wsgi_environ = wsgi_environ or {}
+        self._wsgi_environ = wsgi_environ or {}
         self.method = wsgi_environ.get('REQUEST_METHOD')
         self.GET.update(wsgi_environ.get('zato.http.GET', {}))
         self.POST.update(wsgi_environ.get('zato.http.POST', {}))
         self.path = wsgi_environ.get('PATH_INFO')
         self.params.update(wsgi_environ.get('zato.http.path_params', {}))
+
+    def get_form_data(self):
+        # type: () -> FieldStorage
+
+        # This is the form data uploaded to the service
+        data = self._wsgi_environ['zato.http.raw_request']
+
+        # Create a buffer to hold the form data and write the form to it
+        buff = BytesIO()
+        buff.write(data)
+        buff.seek(0)
+
+        # Output to return
+        form = FieldStorage(fp=buff, environ=self._wsgi_environ, keep_blank_values=True)
+
+        # Clean up
+        buff.close()
+
+        # Return the parsed form data
+        return form
 
     def __repr__(self):
         return make_repr(self)
@@ -489,19 +514,20 @@ class SimpleIOPayload(SIOConverter):
             return top
 
 # ################################################################################################################################
+# ################################################################################################################################
 
 class Outgoing(object):
-    """ A container for various outgoing connections a service can access. This
-    in fact is a thin wrapper around data fetched from the service's self.worker_store.
+    """ A container for various outgoing connections a service can access. This in fact is a thin wrapper around data
+    fetched from the service's self.worker_store.
     """
     __slots__ = ('amqp', 'ftp', 'ibm_mq', 'jms_wmq', 'wmq', 'odoo', 'plain_http', 'soap', 'sql', 'stomp', 'zmq', 'wsx', 'vault',
-        'sms', 'sap')
+        'sms', 'sap', 'sftp', 'ldap', 'mongodb', 'def_kafka')
 
     def __init__(self, amqp=None, ftp=None, jms_wmq=None, odoo=None, plain_http=None, soap=None, sql=None, stomp=None, zmq=None,
-            wsx=None, vault=None, sms=None, sap=None):
+            wsx=None, vault=None, sms=None, sap=None, sftp=None, ldap=None, mongodb=None, def_kafka=None):
         self.amqp = amqp
         self.ftp = ftp
-        self.ibm_mq = self.wmq = self.jms_wmq = jms_wmq # Backward compat with 2.0, self.wmq is not preferred
+        self.ibm_mq = self.wmq = self.jms_wmq = jms_wmq # Backward compat with 2.0, self.ibm_mq is now preferred
         self.odoo = odoo
         self.plain_http = plain_http
         self.soap = soap
@@ -512,24 +538,63 @@ class Outgoing(object):
         self.vault = vault
         self.sms = sms
         self.sap = sap
+        self.sftp = sftp
+        self.ldap = ldap
+        self.mongodb = mongodb
+        self.def_kafka = None
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class AWS(object):
     def __init__(self, s3=None):
         self.s3 = s3
 
+# ################################################################################################################################
+# ################################################################################################################################
+
 class OpenStack(object):
     def __init__(self, swift=None):
         self.swift = swift
 
+# ################################################################################################################################
+# ################################################################################################################################
+
 class Cloud(object):
     """ A container for cloud-related connections a service can establish.
     """
-    __slots__ = ('aws', 'openstack')
+    __slots__ = 'aws', 'openstack'
 
     def __init__(self, aws=None, openstack=None):
         self.aws = aws or AWS()
         self.openstack = openstack or OpenStack()
 
+# ################################################################################################################################
+# ################################################################################################################################
+
+class Definition(object):
+    """ A container for connection definitions a service has access to.
+    """
+    __slots__ = 'kafka',
+
+    def __init__(self, kafka=None):
+        # type: (dict)
+        self.kafka = kafka
+
+# ################################################################################################################################
+# ################################################################################################################################
+
+class InstantMessaging(object):
+    """ A container for Instant Messaging connections, e.g. Slack or Telegram.
+    """
+    __slots__ = 'slack', 'telegram'
+
+    def __init__(self, slack=None, telegram=None):
+        # type: (dict, dict)
+        self.slack = slack
+        self.telegram = telegram
+
+# ################################################################################################################################
 # ################################################################################################################################
 
 class Response(object):

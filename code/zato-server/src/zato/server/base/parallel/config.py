@@ -9,18 +9,25 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-from contextlib import closing
 import os
+from contextlib import closing
+from logging import getLogger
 
 # Zato
 from zato.bunch import Bunch
-from zato.common import MISC, SECRETS
+from zato.common import RATE_LIMIT, SECRETS
 from zato.common.util import asbool
 from zato.common.util.sql import elems_with_opaque
+from zato.common.util.url_dispatcher import get_match_target
 from zato.server.config import ConfigDict
 from zato.server.message import JSONPointerStore, NamespaceStore, XPathStore
 from zato.url_dispatcher import Matcher
 
+# ################################################################################################################################
+
+logger = getLogger(__name__)
+
+# ################################################################################################################################
 # ################################################################################################################################
 
 class ConfigLoader(object):
@@ -104,6 +111,7 @@ class ConfigLoader(object):
         query = self.odb.get_definition_amqp_list(server.cluster.id, True)
         self.config.definition_amqp = ConfigDict.from_query('definition_amqp', query, decrypt_func=self.decrypt)
 
+        # IBM MQ
         query = self.odb.get_definition_wmq_list(server.cluster.id, True)
         self.config.definition_wmq = ConfigDict.from_query('definition_wmq', query, decrypt_func=self.decrypt)
 
@@ -160,11 +168,15 @@ class ConfigLoader(object):
 
         # SAP RFC
         query = self.odb.get_out_sap_list(server.cluster.id, True)
-        self.config.out_sap = ConfigDict.from_query('out_sap', query)
+        self.config.out_sap = ConfigDict.from_query('out_sap', query, decrypt_func=self.decrypt)
 
-         # Plain HTTP
+        # REST
         query = self.odb.get_http_soap_list(server.cluster.id, 'outgoing', 'plain_http', True)
         self.config.out_plain_http = ConfigDict.from_query('out_plain_http', query, decrypt_func=self.decrypt)
+
+        # SFTP
+        query = self.odb.get_out_sftp_list(server.cluster.id, True)
+        self.config.out_sftp = ConfigDict.from_query('out_sftp', query, decrypt_func=self.decrypt, drop_opaque=True)
 
         # SOAP
         query = self.odb.get_http_soap_list(server.cluster.id, 'outgoing', 'soap', True)
@@ -218,7 +230,8 @@ class ConfigLoader(object):
 
         # OpenStack Swift
         query = self.odb.get_notif_cloud_openstack_swift_list(server.cluster.id, True)
-        self.config.notif_cloud_openstack_swift = ConfigDict.from_query('notif_cloud_openstack_swift', query, decrypt_func=self.decrypt)
+        self.config.notif_cloud_openstack_swift = ConfigDict.from_query('notif_cloud_openstack_swift',
+            query, decrypt_func=self.decrypt)
 
         # SQL
         query = self.odb.get_notif_sql_list(server.cluster.id, True)
@@ -302,8 +315,8 @@ class ConfigLoader(object):
         query = self.odb.get_xpath_sec_list(server.cluster.id, True)
         self.config.xpath_sec = ConfigDict.from_query('xpath_sec', query, decrypt_func=self.decrypt)
 
-        # New in 3.0 - encrypt all old secrets
-        self._migrate_30_encrypt_secrets()
+        # Encrypt all secrets
+        self._encrypt_secrets()
 
         #
         # Security - end
@@ -320,7 +333,7 @@ class ConfigLoader(object):
             for key in item.keys():
                 hs_item[key] = getattr(item, key)
 
-            hs_item['match_target'] = '{}{}{}'.format(hs_item['soap_action'], MISC.SEPARATOR, hs_item['url_path'])
+            hs_item['match_target'] = get_match_target(hs_item, http_methods_allowed_re=self.http_methods_allowed_re)
             hs_item['match_target_compiled'] = Matcher(hs_item['match_target'], hs_item.get('match_slash', ''))
 
             http_soap.append(hs_item)
@@ -387,47 +400,89 @@ class ConfigLoader(object):
         self.config.json_pointer_store = JSONPointerStore()
         self.config.xpath_store = XPathStore()
 
+        # HTTP access log should optionally ignore certain requests
+        access_log_ignore = self.fs_server_config.get('logging', {}).get('http_access_log_ignore')
+        if access_log_ignore:
+            access_log_ignore = access_log_ignore if isinstance(access_log_ignore, list) else [access_log_ignore]
+            self.needs_all_access_log = False
+            self.access_log_ignore.update(access_log_ignore)
+
         # Assign config to worker
         self.worker_store.worker_config = self.config
 
 # ################################################################################################################################
 
-    def _migrate_30_encrypt_secrets(self):
-        """ New in 3.0 - all passwords are always encrypted so we need to look up any that are not,
-        for instance, because it is a cluster newly migrated from 2.0 to 3.0, and encrypt them now in ODB.
-        """
-        sec_config_dict_types = ('apikey', 'aws', 'basic_auth', 'jwt', 'ntlm', 'oauth', 'openstack_security',
-            'tls_key_cert', 'wss', 'vault_conn_sec', 'xpath_sec')
+    def delete_object_rate_limiting(self, object_type, object_name):
+        if self.rate_limiting.has_config(object_type, object_name):
+            self.rate_limiting.delete(object_type, object_name)
 
-        # Global lock to make sure only one server attempts to do it at a time
-        with self.zato_lock_manager('migrate_30_encrypt_secrets'):
+# ################################################################################################################################
 
-            # An SQL session shared by all updates
-            with closing(self.odb.session()) as session:
+    def set_up_rate_limiting(self, _config_store=('apikey', 'basic_auth', 'jwt'), _sec_def=RATE_LIMIT.OBJECT_TYPE.SEC_DEF,
+        _http_soap=RATE_LIMIT.OBJECT_TYPE.HTTP_SOAP):
 
-                # Iterate over all security definitions
-                for sec_config_dict_type in sec_config_dict_types:
-                    config_dicts = getattr(self.config, sec_config_dict_type)
-                    for config in config_dicts.values():
-                        config = config['config']
+        for config_store_name in _config_store:
+            config_dict = self.config[config_store_name] # type: ConfigDict
+            for object_name in config_dict: # type: unicode
+                self.set_up_object_rate_limiting(_sec_def, object_name, config_store_name)
 
-                        # Continue to encryption only if needed and not already encrypted
-                        if config.get('_encryption_needed'):
-                            if not config['_encrypted_in_odb']:
-                                odb_func = getattr(self.odb, '_migrate_30_encrypt_sec_{}'.format(sec_config_dict_type))
+        for item in self.config['http_soap']: # type: dict
+            # Do not try to set up rate limiting if we know there is no configuration for it available
+            if 'is_rate_limit_active' in item:
+                self.set_up_object_rate_limiting(_http_soap, item['name'], config=item)
 
-                                # Encrypt all params that are applicable
-                                for secret_param in SECRETS.PARAMS:
-                                    if secret_param in config:
-                                        encrypted = self.encrypt(config[secret_param])
-                                        odb_func(session, config['id'], secret_param, encrypted)
+# ################################################################################################################################
 
-                        # Clean up config afterwards
-                        config.pop('_encryption_needed', None)
-                        config.pop('_encrypted_in_odb', None)
+    def set_up_object_rate_limiting(self, object_type, object_name, config_store_name=None, config=None,
+        _exact=RATE_LIMIT.TYPE.EXACT.id):
+        # type: (unicode, unicode, unicode, dict) -> bool
 
-                # Commit to SQL now that all updates are made
-                session.commit()
+        if not config:
+            config = self.config[config_store_name].get(object_name) # type: ConfigDict
+            config = config['config'] # type: dict
+
+        is_rate_limit_active = config.get('is_rate_limit_active') or False # type: bool
+
+        if is_rate_limit_active:
+
+            # This is reusable no matter if it is edit or create action
+            rate_limit_def = config['rate_limit_def']
+            is_exact = config['rate_limit_type'] == _exact
+
+            # Base dict that will be used as is, if we are to create the rate limiting configuration,
+            # or it will be updated with existing configuration, if it already exists.
+            rate_limit_config = {
+                'id': '{}.{}'.format(object_type, config['id']),
+                'is_active': is_rate_limit_active,
+                'type_': object_type,
+                'name': object_name,
+                'parent_type': None,
+                'parent_name': None,
+            }
+
+            # Do we have such configuration already?
+            existing_config = self.rate_limiting.get_config(object_type, object_name)
+
+            # .. if yes, we will be updating it
+            if existing_config:
+                rate_limit_config['parent_type'] = existing_config.parent_type
+                rate_limit_config['parent_name'] = existing_config.parent_name
+
+                self.rate_limiting.edit(object_type, object_name, rate_limit_config, rate_limit_def, is_exact)
+
+            # .. otherwise, we will be creating a new one
+            else:
+                self.rate_limiting.create(rate_limit_config, rate_limit_def, is_exact)
+
+        # We are not to have any rate limits, but it is possible that previously we were required to,
+        # in which case this needs to be cleaned up.
+        else:
+            existing_config = self.rate_limiting.get_config(object_type, object_name)
+            if existing_config:
+                object_info = existing_config.object_info
+                self.rate_limiting.delete(object_info.type_, object_info.name)
+
+        return is_rate_limit_active
 
 # ################################################################################################################################
 
@@ -491,7 +546,49 @@ class ConfigLoader(object):
 
 # ################################################################################################################################
 
+    def _encrypt_secrets(self):
+        """ All passwords are always encrypted so we need to look up any that are not,
+        for instance, because it is a cluster newly migrated from 2.0 to 3.0, and encrypt them now in ODB.
+        """
+        sec_config_dict_types = ('apikey', 'aws', 'basic_auth', 'jwt', 'ntlm', 'oauth', 'openstack_security',
+            'tls_key_cert', 'wss', 'vault_conn_sec', 'xpath_sec')
+
+        # Global lock to make sure only one server attempts to do it at a time
+        with self.zato_lock_manager('zato_encrypt_secrets'):
+
+            # An SQL session shared by all updates
+            with closing(self.odb.session()) as session:
+
+                # Iterate over all security definitions
+                for sec_config_dict_type in sec_config_dict_types:
+                    config_dicts = getattr(self.config, sec_config_dict_type)
+                    for config in config_dicts.values():
+                        config = config['config']
+
+                        # Continue to encryption only if needed and not already encrypted
+                        if config.get('_encryption_needed'):
+                            if not config['_encrypted_in_odb']:
+                                odb_func = getattr(self.odb, '_migrate_30_encrypt_sec_{}'.format(sec_config_dict_type))
+
+                                # Encrypt all params that are applicable
+                                for secret_param in SECRETS.PARAMS:
+                                    if secret_param in config:
+                                        data = config[secret_param]
+                                        if data:
+                                            encrypted = self.encrypt(data)
+                                            odb_func(session, config['id'], secret_param, encrypted)
+
+                        # Clean up config afterwards
+                        config.pop('_encryption_needed', None)
+                        config.pop('_encrypted_in_odb', None)
+
+                # Commit to SQL now that all updates are made
+                session.commit()
+
+# ################################################################################################################################
+
     def _after_init_non_accepted(self, server):
         raise NotImplementedError("This Zato version doesn't support join states other than ACCEPTED")
 
+# ################################################################################################################################
 # ################################################################################################################################

@@ -21,9 +21,10 @@ from django.core.urlresolvers import resolve
 # Zato
 from zato.admin.settings import ADMIN_INVOKE_NAME, ADMIN_INVOKE_PASSWORD, ADMIN_INVOKE_PATH, SASession, settings_db
 from zato.admin.web.forms import SearchForm
-from zato.admin.web.models import ClusterColorMarker, UserProfile
+from zato.admin.web.models import ClusterColorMarker
+from zato.admin.web.util import get_user_profile
 from zato.client import AnyServiceInvoker
-from zato.common import version
+from zato.common import get_version
 from zato.common.odb.model import Cluster
 
 # New in 2.0.8 thus optional
@@ -32,6 +33,9 @@ try:
 except ImportError:
     lb_use_tls = False
     lb_tls_verify = True
+
+# Zato version
+version = get_version()
 
 # Code below is taken from http://djangosnippets.org/snippets/136/
 # Slightly modified for Zato's purposes.
@@ -118,12 +122,8 @@ class ZatoMiddleware(object):
             req.zato.search_form = SearchForm(req.zato.clusters, req.GET)
 
             if not req.user.is_anonymous():
-                try:
-                    user_profile = UserProfile.objects.get(user=req.user)
-                except UserProfile.DoesNotExist:
-                    user_profile = UserProfile(user=req.user)
-                    user_profile.save()
-                req.zato.user_profile = user_profile
+                needs_logging = not req.get_full_path().endswith(('.js', '.css', '.png'))
+                req.zato.user_profile = get_user_profile(req.user, needs_logging)
             else:
                 req.zato.user_profile = None
         except Exception:

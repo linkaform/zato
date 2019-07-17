@@ -10,7 +10,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 # stdlib
 from contextlib import contextmanager
-from io import StringIO
+from io import BytesIO
 from logging import getLogger, INFO
 from traceback import format_exc
 
@@ -23,7 +23,7 @@ from imbox.parser import parse_email
 from outbox import AnonymousOutbox, Attachment, Email, Outbox
 
 # Python 2/3 compatibility
-from past.builtins import basestring
+from past.builtins import basestring, unicode
 
 # Zato
 from zato.common import IMAPMessage, EMAIL
@@ -126,7 +126,13 @@ class SMTPConnection(_Connection):
     def send(self, msg, from_=None):
 
         headers = msg.headers or {}
-        atts = [Attachment(att['name'], StringIO(att['contents'])) for att in msg.attachments] if msg.attachments else []
+        atts = []
+        if msg.attachments:
+            for item in msg.attachments:
+                contents  = item['contents']
+                contents = contents.encode('utf8') if isinstance(contents, unicode) else contents
+                att = Attachment(item['name'], BytesIO(contents))
+                atts.append(att)
 
         if 'From' not in msg.headers:
             headers['From'] = msg.from_

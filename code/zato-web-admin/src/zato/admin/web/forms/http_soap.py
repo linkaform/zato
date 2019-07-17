@@ -14,18 +14,25 @@ from django import forms
 # Zato
 from zato.admin.web.forms import add_security_select, add_select, add_services, SearchForm as _ChooseClusterForm, \
      DataFormatForm, INITIAL_CHOICES
-from zato.common import DEFAULT_HTTP_PING_METHOD, DEFAULT_HTTP_POOL_SIZE, HTTP_SOAP_SERIALIZATION_TYPE, \
-     MISC, PARAMS_PRIORITY, SIMPLE_IO, SOAP_VERSIONS, URL_PARAMS_PRIORITY, ZATO_NONE
+from zato.common import DEFAULT_HTTP_PING_METHOD, DEFAULT_HTTP_POOL_SIZE, HTTP_SOAP, HTTP_SOAP_SERIALIZATION_TYPE, \
+     MISC, PARAMS_PRIORITY, RATE_LIMIT, SIMPLE_IO, SOAP_VERSIONS, URL_PARAMS_PRIORITY, ZATO_NONE
+
+# ################################################################################################################################
 
 params_priority = (
     (PARAMS_PRIORITY.CHANNEL_PARAMS_OVER_MSG, 'URL over message'),
     (PARAMS_PRIORITY.MSG_OVER_CHANNEL_PARAMS, 'Message over URL'),
 )
 
+# ################################################################################################################################
+
 url_params_priority = (
     (URL_PARAMS_PRIORITY.QS_OVER_PATH, 'QS over path'),
     (URL_PARAMS_PRIORITY.PATH_OVER_QS, 'Path over QS'),
 )
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class CreateForm(DataFormatForm):
     name = forms.CharField(widget=forms.TextInput(attrs={'style':'width:100%'}))
@@ -54,6 +61,13 @@ class CreateForm(DataFormatForm):
     cache_expiry = forms.CharField(widget=forms.TextInput(attrs={'style':'width:20%'}), initial=0)
     content_encoding = forms.CharField(widget=forms.TextInput(attrs={'style':'width:20%'}))
     data_formats_allowed = SIMPLE_IO.HTTP_SOAP_FORMAT
+    http_accept = forms.CharField(widget=forms.TextInput(attrs={'style':'width:100%'}), initial=HTTP_SOAP.ACCEPT.ANY)
+
+    is_rate_limit_active = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+    rate_limit_check_parent_def = forms.BooleanField(required=False, widget=forms.CheckboxInput(attrs={'checked':'checked'}))
+    rate_limit_type = forms.ChoiceField(widget=forms.Select(), initial=RATE_LIMIT.TYPE.APPROXIMATE)
+    rate_limit_def = forms.CharField(widget=forms.Textarea(
+        attrs={'style':'overflow:auto; width:100%; white-space: pre-wrap;height:100px'}))
 
     def __init__(self, security_list=[], sec_tls_ca_cert_list={}, cache_list=[], soap_versions=SOAP_VERSIONS,
             prefix=None, post_data=None, req=None):
@@ -88,12 +102,19 @@ class CreateForm(DataFormatForm):
         add_security_select(self, security_list)
         add_services(self, req)
         add_select(self, 'cache_id', cache_list)
+        add_select(self, 'rate_limit_type', RATE_LIMIT.TYPE(), needs_initial_select=False)
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class EditForm(CreateForm):
     is_active = forms.BooleanField(required=False, widget=forms.CheckboxInput())
     merge_url_params_req = forms.BooleanField(required=False, widget=forms.CheckboxInput())
     match_slash = forms.BooleanField(required=False, widget=forms.CheckboxInput())
     has_rbac = forms.BooleanField(required=False, widget=forms.CheckboxInput())
+
+# ################################################################################################################################
+# ################################################################################################################################
 
 class SearchForm(_ChooseClusterForm):
     connection = forms.CharField(widget=forms.HiddenInput())
@@ -104,3 +125,6 @@ class SearchForm(_ChooseClusterForm):
 
         self.initial['connection'] = data.get('connection') or ''
         self.initial['transport'] = data.get('transport') or ''
+
+# ################################################################################################################################
+# ################################################################################################################################

@@ -78,6 +78,9 @@ $.fn.zato.http_soap.data_table.new_row = function(item, data, include_tr) {
     var is_outgoing = connection == 'outgoing';
     var is_soap = data.transport == 'soap';
 
+    var is_rate_limit_active = $.fn.zato.like_bool(data.is_rate_limit_active) == true;
+    var rate_limit_check_parent_def = $.fn.zato.like_bool(data.rate_limit_check_parent_def) == true;
+
     var method_tr = '';
     var soap_action_tr = '';
     var soap_version_tr = '';
@@ -97,7 +100,7 @@ $.fn.zato.http_soap.data_table.new_row = function(item, data, include_tr) {
 
     if(is_channel) {
         service_tr += String.format('<td>{0}</td>', $.fn.zato.data_table.service_text(item.service, cluster_id));
-        method_tr += String.format('<td>{0}</td>', item.method);
+        method_tr += String.format('<td>{0}</td>', item.method ? item.method : $.fn.zato.empty_value);
 
         merge_url_params_req_tr += String.format('<td class="ignore">{0}</td>', merge_url_params_req);
         url_params_pri_tr += String.format('<td class="ignore">{0}</td>', item.url_params_pri);
@@ -184,11 +187,12 @@ $.fn.zato.http_soap.data_table.new_row = function(item, data, include_tr) {
         row += String.format("<td class='ignore'>{0}</td>", item.content_type);
     }
 
-    /* 28,29,30 */
+    /* 28,29,30,30a */
     if(is_channel) {
         row += merge_url_params_req_tr;
         row += url_params_pri_tr;
         row += params_pri_tr;
+        row += item.method ? item.method : '';
     }
 
     /* 31,32 */
@@ -208,6 +212,14 @@ $.fn.zato.http_soap.data_table.new_row = function(item, data, include_tr) {
         }
     }
 
+    /* 35,36,37,38 */
+    if(is_channel) {
+        row += String.format("<td class='ignore'>{0}</td>", is_rate_limit_active);
+        row += String.format("<td class='ignore'>{0}</td>", data.rate_limit_type);
+        row += String.format("<td class='ignore'>{0}</td>", data.rate_limit_def);
+        row += String.format("<td class='ignore'>{0}</td>", rate_limit_check_parent_def);
+    }
+
     if(include_tr) {
         row += '</tr>';
     }
@@ -218,8 +230,8 @@ $.fn.zato.http_soap.data_table.new_row = function(item, data, include_tr) {
 
 $.fn.zato.http_soap.delete_ = function(id) {
     $.fn.zato.data_table.delete_(id, 'td.item_id_',
-        'Object [{0}] deleted',
-        'Are you sure you want to delete the object [{0}]?',
+        'Object `{0}` deleted',
+        'Are you sure you want to delete object `{0}`?',
         true);
 }
 

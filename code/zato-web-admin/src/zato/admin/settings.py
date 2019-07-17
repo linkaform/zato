@@ -153,6 +153,7 @@ else:
     ssl_cert_file = 'dummy'
     ssl_ca_certs = 'dummy'
 
+    lb_agent_use_tls = False
     lb_use_tls = False
     lb_tls_verify = True
 
@@ -167,3 +168,4 @@ else:
     SECRET_KEY = uuid4().hex
 
     settings_db = None
+    is_totp_enabled = False

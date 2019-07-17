@@ -9,20 +9,29 @@ Licensed under LGPLv3, see LICENSE.txt for terms and conditions.
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 # stdlib
-import json, os, sys
+import json
+import os
+import sys
 from traceback import format_exc
 
-# Zato
-from zato.admin.zato_settings import update_globals
-from zato.cli import ManageCommand
+# Python 2/3 compatibility
+from past.builtins import unicode
 
+# Zato
+from zato.admin.web.util import set_user_profile_totp_key
+from zato.admin.zato_settings import update_globals
+from zato.cli import common_totp_opts, ManageCommand
+from zato.cli.util import get_totp_info_from_args
+from zato.common.crypto import WebAdminCryptoManager
+
+# ################################################################################################################################
 # ################################################################################################################################
 
 class _WebAdminAuthCommand(ManageCommand):
     def _prepare(self, args):
         os.chdir(os.path.abspath(args.path))
         base_dir = os.path.join(self.original_dir, args.path)
-        config = json.loads(open(os.path.join(base_dir, './config/repo/web-admin.conf')).read())
+        config = json.loads(open(os.path.join(base_dir, '.', 'config/repo/web-admin.conf')).read())
         config['config_dir'] = os.path.abspath(args.path)
         update_globals(config, base_dir)
 
@@ -35,6 +44,7 @@ class _WebAdminAuthCommand(ManageCommand):
         self.reset_logger(args, True)
         self.logger.info('OK')
 
+# ################################################################################################################################
 # ################################################################################################################################
 
 class CreateUser(_WebAdminAuthCommand):
@@ -111,6 +121,7 @@ class CreateUser(_WebAdminAuthCommand):
             self._ok(args)
 
 # ################################################################################################################################
+# ################################################################################################################################
 
 class UpdatePassword(_WebAdminAuthCommand):
     """ Updates a web admin user's password
@@ -145,4 +156,89 @@ class UpdatePassword(_WebAdminAuthCommand):
         if not called_from_wrapper:
             self._ok(args)
 
+# ################################################################################################################################
+# ################################################################################################################################
+
+class ResetTOTPKey(_WebAdminAuthCommand):
+    """ Resets a user's TOTP secret key. Returns the key on output unless it was given on input.
+    """
+    opts = common_totp_opts
+
+    def before_execute(self, args):
+        super(ResetTOTPKey, self).before_execute(args)
+        self._prepare(args)
+        self.reset_logger(args, True)
+
+    def execute(self, args):
+
+        # Extract or generate a new TOTP key and label
+        key, key_label = get_totp_info_from_args(args)
+
+        from zato.admin.web.models import User
+        from zato.admin.web.util import get_user_profile
+        from zato.admin.zato_settings import zato_secret_key
+        self.reset_logger(args, True)
+
+        try:
+            user = User.objects.get(username=args.username)
+        except User.DoesNotExist:
+            self.logger.warn('No such user `%s` found in `%s`', args.username, args.path)
+            return
+
+        # Here we know we have the user and key for sure, now we need to get the person's profile
+        user_profile = get_user_profile(user, False)
+
+        # Everything is ready, we can reset the key ..
+        opaque_attrs = set_user_profile_totp_key(user_profile, zato_secret_key, key, key_label)
+
+        # .. and save the modified profile.
+        user_profile.opaque1 = json.dumps(opaque_attrs)
+        user_profile.save()
+
+        # Log the key only if it was not given on input. Otherwise the user is expected to know it already
+        # and may perhaps want not to disclose it.
+        if self.args.key:
+            self.logger.info('OK')
+        else:
+            self.logger.info(key)
+
+# ################################################################################################################################
+# ################################################################################################################################
+
+class SetAdminInvokePassword(_WebAdminAuthCommand):
+    """ Resets a web-admin user's password that it uses to connect to servers.
+    """
+    opts = [
+        {'name': '--username', 'help': 'Username to reset the password of', 'default':'admin.invoke'},
+        {'name': '--password', 'help': 'Password to set'},
+    ]
+
+    def execute(self, args):
+
+        # Find directories for config data
+        os.chdir(os.path.abspath(args.path))
+        base_dir = os.path.join(self.original_dir, args.path)
+        repo_dir = os.path.join(base_dir, 'config', 'repo')
+
+        # Read config in
+        config_path = os.path.join(repo_dir, 'web-admin.conf')
+        config_data = open(config_path).read()
+
+        # Encrypted the provided password
+        cm = WebAdminCryptoManager(repo_dir=repo_dir)
+        encrypted = cm.encrypt(args.password.encode('utf8') if isinstance(args.password, unicode) else args.password)
+
+        # Update the config file in-place so as not to reformat its contents
+        new_config = []
+        for line in config_data.splitlines():
+            if 'ADMIN_INVOKE_PASSWORD' in line:
+                encrypted = encrypted.decode('utf8') if not isinstance(encrypted, unicode) else encrypted
+                line = '  "ADMIN_INVOKE_PASSWORD": "{}",'.format(encrypted)
+            new_config.append(line)
+
+        # Save config with the updated password
+        new_config = '\n'.join(new_config)
+        open(config_path, 'w').write(new_config)
+
+# ################################################################################################################################
 # ################################################################################################################################
