@@ -11,6 +11,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 # stdlib
 from datetime import datetime, timedelta
 from http.client import BAD_REQUEST, INTERNAL_SERVER_ERROR, NOT_FOUND, responses
+from json import loads
 from logging import getLogger
 from threading import current_thread
 from traceback import format_exc
@@ -21,9 +22,6 @@ from bunch import Bunch, bunchify
 # gevent
 from gevent import sleep, socket, spawn
 from gevent.lock import RLock
-
-# pyrapidjson
-from rapidjson import loads
 
 # ws4py
 from ws4py.websocket import WebSocket as _WebSocket
@@ -71,7 +69,12 @@ hook_type_to_method = {
     WEB_SOCKET.HOOK_TYPE.ON_CONNECTED: 'on_connected',
     WEB_SOCKET.HOOK_TYPE.ON_DISCONNECTED: 'on_disconnected',
     WEB_SOCKET.HOOK_TYPE.ON_PUBSUB_RESPONSE: 'on_pubsub_response',
+    WEB_SOCKET.HOOK_TYPE.ON_VAULT_MOUNT_POINT_NEEDED: 'on_vault_mount_point_needed',
 }
+
+# ################################################################################################################################
+
+_cannot_send = 'Cannot send on a terminated websocket'
 
 # ################################################################################################################################
 
@@ -144,6 +147,9 @@ class WebSocket(_WebSocket):
         self.user_data = Bunch() # Arbitrary user-defined data
         self._disconnect_requested = False # Have we been asked to disconnect this client?
 
+        # This will be populated by the on_vault_mount_point_needed hook
+        self.vault_mount_point = None
+
         # Last the we received a ping response (pong) from our peer
         self.ping_last_response_time = None
 
@@ -194,15 +200,19 @@ class WebSocket(_WebSocket):
             self.on_pubsub_response_service_invoker = self.hook_tool.get_hook_service_invoker(
                 self.config.hook_service, WEB_SOCKET.HOOK_TYPE.ON_PUBSUB_RESPONSE)
 
+            self.on_vault_mount_point_needed = self.hook_tool.get_hook_service_invoker(
+                self.config.hook_service, WEB_SOCKET.HOOK_TYPE.ON_VAULT_MOUNT_POINT_NEEDED)
+
         else:
             self.hook_tool = None
             self.on_connected_service_invoker = None
             self.on_disconnected_service_invoker = None
             self.on_pubsub_response_service_invoker = None
+            self.on_vault_mount_point_needed = None
 
         # For publish/subscribe over WSX
         self.pubsub_tool = PubSubTool(self.config.parallel_server.worker_store.pubsub, self,
-            PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id, self.deliver_pubsub_msg)
+            PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id, deliver_pubsub_msg=self.deliver_pubsub_msg)
 
         # Active WebSocket client ID (WebSocketClient model, web_socket_client.id in SQL)
         self._sql_ws_client_id = None
@@ -427,9 +437,18 @@ class WebSocket(_WebSocket):
 
 # ################################################################################################################################
 
+    def get_on_vault_mount_point_needed(self):
+        """ Returns a hook triggered when a Vault moint point needed to check credentials is not known.
+        """
+        if self.hook_tool:
+            return self.on_vault_mount_point_needed
+
+# ################################################################################################################################
+
     def parse_json(self, data, _create_session=WEB_SOCKET.ACTION.CREATE_SESSION, _response=WEB_SOCKET.ACTION.CLIENT_RESPONSE):
 
-        parsed = loads(data.decode('utf8'))
+        data = data.decode('utf8')
+        parsed = loads(data)
         msg = ClientMessage()
 
         meta = parsed.get('meta', {})
@@ -495,6 +514,15 @@ class WebSocket(_WebSocket):
         if not self.config.needs_auth:
             can_create_session = True
         else:
+
+            # Discover which Vault mount point credentials will be under, unless we know it already.
+            if not self.vault_mount_point:
+                hook = self.get_on_vault_mount_point_needed()
+                if hook:
+                    hook(**self._get_hook_request())
+
+            headers['HTTP_X_ZATO_VAULT_MOUNT_POINT'] = self.vault_mount_point
+
             can_create_session = self.config.auth_func(
                 request.cid, self.sec_type, {'username':request.username, 'secret':request.secret}, self.config.sec_name,
                 self.config.vault_conn_default_auth_method, self.initial_http_wsgi_environ, headers)
@@ -744,7 +772,7 @@ class WebSocket(_WebSocket):
 
         serialized = response.serialize()
 
-        logger.info('Sending response `%s` from to `%s` `%s` `%s` `%s`', serialized,
+        logger.info('Sending response `%s` from to `%s` `%s` `%s` `%s` %s', serialized,
             self.python_id, self.pub_client_id, self.ext_client_id, self.ext_client_name, self.peer_conn_info_pretty)
 
         try:
@@ -831,6 +859,10 @@ class WebSocket(_WebSocket):
                     self.on_forbidden('did not send token')
                     return
 
+                if request.token != self.token.value:
+                    self.on_forbidden('sent an invalid token (`{!r}` instead `{!r}`)'.format(request.token, self.token.value))
+                    return
+
                 # Reject request if token is provided but it already expired
                 if _now() > self.token.expires_at:
                     self.on_forbidden('used an expired token')
@@ -840,8 +872,8 @@ class WebSocket(_WebSocket):
                 try:
                     self.handle_client_message(cid, request) if not request.is_auth else self.handle_create_session(cid, request)
                 except RuntimeError as e:
-                    if str(e) == 'Cannot send on a terminated websocket':
-                        msg = 'Ignoring message (client disconnected), cid:`%s`, request:`%s` conn:`%s`'
+                    if str(e) == _cannot_send:
+                        msg = 'Ignoring message (socket terminated #1), cid:`%s`, request:`%s` conn:`%s`'
                         logger.info(msg, cid, request, self.peer_conn_info_pretty)
                         logger_zato.info(msg, cid, request, self.peer_conn_info_pretty)
                     else:
@@ -875,6 +907,15 @@ class WebSocket(_WebSocket):
         """
         self.pubsub_tool.handle_new_messages(HandleNewMessageCtx(cid, request['has_gd'], request['sub_key_list'],
             request['non_gd_msg_list'], request['is_bg_call'], request['pub_time_max']))
+
+# ################################################################################################################################
+
+    def subscribe_to_topic(self, cid, request):
+        """ Subscribes current WebSocket a topic pointed to by input request object.
+        """
+        self.invoke_service('zato.pubsub.subscription.create-wsx-subscription-for-current', {
+            'topic_name': request
+        }, cid=cid)
 
 # ################################################################################################################################
 
@@ -928,8 +969,17 @@ class WebSocket(_WebSocket):
             logger.info('Sending message `%s` from `%s` to `%s` `%s` `%s` `%s`', serialized,
                 self.python_id, self.pub_client_id, self.ext_client_id, self.ext_client_name, self.peer_conn_info_pretty)
 
-        # Actually send the message now
-        (self.send if use_send else self.ping)(serialized)
+        try:
+            (self.send if use_send else self.ping)(serialized)
+        except RuntimeError as e:
+            if str(e) == _cannot_send:
+                msg = 'Cannot send message (socket terminated #2), disconnecting client, cid:`%s`, msg:`%s` conn:`%s`'
+                logger.info(msg, cid, serialized, self.peer_conn_info_pretty)
+                logger_zato.info(msg, cid, serialized, self.peer_conn_info_pretty)
+                self.disconnect_client()
+                raise Exception('WSX client disconnected cid:`{}, peer:`{}`'.format(cid, self.peer_conn_info_pretty))
+            else:
+                raise
 
         # Wait for response but only if it is not a pub/sub message,
         # these are always asynchronous and that channel's WSX hook
@@ -1040,7 +1090,7 @@ class WebSocketContainer(WebSocketWSGIApplication):
 
         try:
             if environ['PATH_INFO'] != self.config.path:
-                start_response(http404_bytes, {})
+                start_response(http404, {})
                 return [error_response[NOT_FOUND][self.config.data_format]]
 
             super(WebSocketContainer, self).__call__(environ, start_response)
@@ -1060,9 +1110,13 @@ class WebSocketContainer(WebSocketWSGIApplication):
     def notify_pubsub_message(self, cid, pub_client_id, request):
         return self.clients[pub_client_id].notify_pubsub_message(cid, request)
 
+    def subscribe_to_topic(self, cid, pub_client_id, request):
+        return self.clients[pub_client_id].subscribe_to_topic(cid, request)
+
     def get_client_by_pub_id(self, pub_client_id):
         return self.clients[pub_client_id]
 
+# ################################################################################################################################
 # ################################################################################################################################
 
 class WebSocketServer(WSGIServer):
@@ -1119,6 +1173,7 @@ class WebSocketServer(WSGIServer):
         return sock
 
 # ################################################################################################################################
+# ################################################################################################################################
 
     def invoke_client(self, cid, pub_client_id, request, timeout):
         return self.application.invoke_client(cid, pub_client_id, request, timeout)
@@ -1132,9 +1187,13 @@ class WebSocketServer(WSGIServer):
     def notify_pubsub_message(self, cid, pub_client_id, request):
         return self.application.notify_pubsub_message(cid, pub_client_id, request)
 
+    def subscribe_to_topic(self, cid, pub_client_id, request):
+        return self.application.subscribe_to_topic(cid, pub_client_id, request)
+
     def get_client_by_pub_id(self, pub_client_id):
         return self.application.get_client_by_pub_id(pub_client_id)
 
+# ################################################################################################################################
 # ################################################################################################################################
 
 class ChannelWebSocket(Connector):
@@ -1171,7 +1230,11 @@ class ChannelWebSocket(Connector):
     def notify_pubsub_message(self, cid, pub_client_id, request):
         return self._wsx_server.notify_pubsub_message(cid, pub_client_id, request)
 
+    def subscribe_to_topic(self, cid, pub_client_id, request):
+        return self._wsx_server.subscribe_to_topic(cid, pub_client_id, request)
+
     def get_client_by_pub_id(self, pub_client_id):
         return self._wsx_server.get_client_by_pub_id(pub_client_id)
 
+# ################################################################################################################################
 # ################################################################################################################################

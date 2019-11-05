@@ -35,8 +35,8 @@ from zato.common.odb.model import SSOLinkedAuth as LinkedAuth, SSOUser as UserMo
 from zato.common.util.json_ import dumps
 from zato.sso import const, not_given, status_code, User as UserEntity, ValidationError
 from zato.sso.attr import AttrAPI
-from zato.sso.odb.query import get_linked_auth_list, get_sign_up_status_by_token, get_user_by_id, get_user_by_username, \
-     get_user_by_ust
+from zato.sso.odb.query import get_linked_auth_list, get_sign_up_status_by_token, get_user_by_id, get_user_by_linked_sec, \
+     get_user_by_username, get_user_by_ust
 from zato.sso.session import LoginCtx, SessionAPI
 from zato.sso.user_search import SSOSearch
 from zato.sso.util import check_credentials, check_remote_app_exists, make_data_secret, make_password_secret, new_confirm_token, \
@@ -470,10 +470,10 @@ class UserAPI(object):
             ctx.data['last_name'] = user.last_name
             ctx.data['is_active'] = user.is_active
             ctx.data['is_internal'] = user.is_internal
-            ctx.data['approval_status'] = user.approval_status
+            ctx.data['approval_status'] = approval_status
             ctx.data['approval_status_mod_time'] = user.approval_status_mod_time
             ctx.data['approval_status_mod_by'] = user.approval_status_mod_by
-            ctx.data['is_approval_needed'] = self.sso_conf.signup.is_approval_needed
+            ctx.data['is_approval_needed'] = approval_status != const.approval_status.approved
             ctx.data['is_locked'] = user.is_locked
             ctx.data['is_super_user'] = user.is_super_user
             ctx.data['password_is_set'] = user.password_is_set
@@ -612,7 +612,7 @@ class UserAPI(object):
 
 # ################################################################################################################################
 
-    def _get_user_by_attr(self, cid, func, attr_value, current_ust, current_app, remote_addr, _needs_super_user,
+    def _get_user(self, cid, func, query_criteria, current_ust, current_app, remote_addr, _needs_super_user,
         queries_current_session, _utcnow=_utcnow):
         """ Returns a user by a specific function and business value.
         """
@@ -626,7 +626,7 @@ class UserAPI(object):
             if queries_current_session:
                 info = current_session
             else:
-                info = func(session, attr_value, _utcnow())
+                info = func(session, query_criteria, _utcnow())
 
             # Input UST is invalid for any reason (perhaps has just expired), raise an exception in that case
             if not info:
@@ -676,7 +676,7 @@ class UserAPI(object):
         # PII audit comes first
         audit_pii.info(cid, 'user.get_current_user', extra={'current_app':current_app, 'remote_addr':remote_addr})
 
-        return self._get_user_by_attr(
+        return self._get_user(
             cid, get_user_by_ust, self.decrypt_func(current_ust), current_ust, current_app, remote_addr, False, True)
 
 # ################################################################################################################################
@@ -688,7 +688,19 @@ class UserAPI(object):
         audit_pii.info(cid, 'user.get_user_by_id', target_user=user_id,
             extra={'current_app':current_app, 'remote_addr':remote_addr})
 
-        return self._get_user_by_attr(cid, get_user_by_id, user_id, current_ust, current_app, remote_addr, True, False)
+        return self._get_user(cid, get_user_by_id, user_id, current_ust, current_app, remote_addr, True, False)
+
+# ################################################################################################################################
+
+    def get_user_by_linked_auth(self, cid, sec_type, sec_username, current_ust, current_app, remote_addr):
+        """ Returns a user object by that person's linked security name, e.g. maps a Basic Auth username to an SSO user.
+        """
+        # PII audit comes first
+        audit_pii.info(cid, 'user.get_user_by_linked_sec', target_user=sec_username,
+            extra={'current_app':current_app, 'remote_addr':remote_addr, 'sec_type': sec_type})
+
+        return self._get_user(
+            cid, get_user_by_linked_sec, (sec_type, sec_username) , current_ust, current_app, remote_addr, False, True)
 
 # ################################################################################################################################
 
@@ -1110,11 +1122,14 @@ class UserAPI(object):
         # .. so if it is sent ..
         if user_id != _no_user_id:
 
-            # .. we must confirm we have a super-user's session.
-            if not current_session.is_super_user:
-                logger.warn('Current user `%s` is not a super-user, cannot change password for user `%s`',
-                    current_session.user_id, user_id)
-                raise ValidationError(status_code.common.invalid_input, False)
+            # .. and we are not changing our own password ..
+            if current_session.user_id != user_id:
+
+                # .. we must confirm we have a super-user's session.
+                if not current_session.is_super_user:
+                    logger.warn('Current user `%s` is not a super-user, cannot change password for user `%s`',
+                        current_session.user_id, user_id)
+                    raise ValidationError(status_code.common.invalid_input, False)
 
         # .. if ID is not given on input, we change current user's password.
         else:
@@ -1311,6 +1326,7 @@ class UserAPI(object):
                 logger.warn('Could not add auth link e:`%s`', format_exc())
                 raise ValueError('Auth link could not be added')
             else:
+                self._add_user_id_to_linked_auth(auth_type, auth_id, user_id)
                 return instance.user_id, auth_id
 
 # ################################################################################################################################

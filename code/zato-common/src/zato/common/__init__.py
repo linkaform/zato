@@ -536,7 +536,7 @@ class CACHE:
 
     class DEFAULT:
         MAX_SIZE = 10000
-        MAX_ITEM_SIZE = 1000 # In characters for string/unicode, bytes otherwise
+        MAX_ITEM_SIZE = 10000 # In characters for string/unicode, bytes otherwise
 
     class PERSISTENT_STORAGE:
         NO_PERSISTENT_STORAGE = NameId('No persistent storage', 'no-persistent-storage')
@@ -911,6 +911,13 @@ class PUBSUB:
         ON_NO_SUBS_PUB = 'accept'
         SK_OPAQUE = ('deliver_to_sk', 'reply_to_sk')
 
+    class SERVICE_SUBSCRIBER:
+        NAME = 'zato.pubsub.service.endpoint'
+        TOPICS_ALLOWED = 'sub=/zato/s/to/*'
+
+    class TOPIC_PATTERN:
+        TO_SERVICE = '/zato/s/to/{}'
+
     class QUEUE_TYPE:
         STAGING = 'staging'
         CURRENT = 'current'
@@ -976,7 +983,7 @@ class PUBSUB:
         IMAP = NameId('IMAP', 'imap')
         INTERNAL = NameId('Internal', 'internal')
         REST = NameId('REST', 'rest')
-        SERVICE = NameId('Service', 'service')
+        SERVICE = NameId('Service', 'srv')
         SMS_TWILIO = NameId('SMS - Twilio', 'smstw')
         SMTP = NameId('SMTP', 'smtp')
         SOAP = NameId('SOAP', 'soap')
@@ -984,7 +991,8 @@ class PUBSUB:
         WEB_SOCKETS = NameId('WebSockets', 'wsx')
 
         def __iter__(self):
-            return iter((self.AMQP, self.INTERNAL, self.REST, self.SERVICE, self.SOAP, self.WEB_SOCKETS))
+            return iter((self.AMQP.id, self.INTERNAL.id, self.REST.id, self.SERVICE.id, self.SOAP.id,
+                self.WEB_SOCKETS.id, self.SERVICE.id))
 
     class REDIS:
         META_TOPIC_LAST_KEY = 'zato.ps.meta.topic.last.%s.%s'
@@ -999,6 +1007,7 @@ class _PUBSUB_SUBSCRIBE_CLASS:
     classes = {
         PUBSUB.ENDPOINT_TYPE.AMQP.id: 'zato.pubsub.subscription.subscribe-amqp',
         PUBSUB.ENDPOINT_TYPE.REST.id: 'zato.pubsub.subscription.subscribe-rest',
+        PUBSUB.ENDPOINT_TYPE.SERVICE.id: 'zato.pubsub.subscription.subscribe-service',
         PUBSUB.ENDPOINT_TYPE.SOAP.id: 'zato.pubsub.subscription.subscribe-soap',
         PUBSUB.ENDPOINT_TYPE.WEB_SOCKETS.id: 'zato.pubsub.subscription.create-wsx-subscription',
     }
@@ -1242,6 +1251,7 @@ class WEB_SOCKET:
         ON_CONNECTED = 'wsx_on_connected'
         ON_DISCONNECTED = 'wsx_on_disconnected'
         ON_PUBSUB_RESPONSE = 'wsx_on_pubsub_response'
+        ON_VAULT_MOUNT_POINT_NEEDED = 'wsx_on_vault_mount_point_needed'
 
 # ################################################################################################################################
 # ################################################################################################################################
@@ -1890,8 +1900,10 @@ default_internal_modules = {
     'zato.server.service.internal.pubsub.subscription': True,
     'zato.server.service.internal.pubsub.queue': True,
     'zato.server.service.internal.pubsub.task': True,
-    'zato.server.service.internal.pubsub.task.main': True,
-    'zato.server.service.internal.pubsub.task.delivery_server': True,
+    'zato.server.service.internal.pubsub.task.delivery': True,
+    'zato.server.service.internal.pubsub.task.delivery.message': True,
+    'zato.server.service.internal.pubsub.task.delivery.server': True,
+    'zato.server.service.internal.pubsub.task.sync': True,
     'zato.server.service.internal.pubsub.topic': True,
     'zato.server.service.internal.query.cassandra': True,
     'zato.server.service.internal.scheduler': True,

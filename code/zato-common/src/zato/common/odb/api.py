@@ -21,6 +21,7 @@ from traceback import format_exc
 
 # SQLAlchemy
 from sqlalchemy import and_, create_engine, event, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.orm.query import Query
 from sqlalchemy.pool import NullPool
@@ -426,7 +427,10 @@ class PoolStore(object):
         password.
         """
         with self._lock:
-            self[name].pool.engine.dispose()
+            # Do not check if the connection is active when changing the password,
+            # sometimes it is desirable to change it even if it is Inactive.
+            item = self.get(name, enforce_is_active=False)
+            item.pool.engine.dispose()
             config = deepcopy(self.wrappers[name].pool.config)
             config['password'] = password
             self[name] = config
@@ -529,9 +533,10 @@ class ODBManager(SessionWrapper):
     def get_default_internal_pubsub_endpoint(self):
         with closing(self.session()) as session:
             return session.query(PubSubEndpoint).\
-                   filter(PubSubEndpoint.name==PUBSUB.DEFAULT.INTERNAL_ENDPOINT_NAME).\
-                   filter(PubSubEndpoint.endpoint_type==PUBSUB.ENDPOINT_TYPE.INTERNAL.id).\
-                   one()
+                filter(PubSubEndpoint.name==PUBSUB.DEFAULT.INTERNAL_ENDPOINT_NAME).\
+                filter(PubSubEndpoint.endpoint_type==PUBSUB.ENDPOINT_TYPE.INTERNAL.id).\
+                filter(PubSubEndpoint.cluster_id==self.cluster_id).\
+                one()
 
 # ################################################################################################################################
 
@@ -741,6 +746,7 @@ class ODBManager(SessionWrapper):
 
             query = select([
                 ServiceTable.c.name,
+                DeployedServiceTable.c.source,
             ]).where(and_(
                 DeployedServiceTable.c.service_id==ServiceTable.c.id,
                 DeployedServiceTable.c.server_id==self.server_id
@@ -753,13 +759,27 @@ class ODBManager(SessionWrapper):
 
     def add_services(self, session, data):
         # type: (List[dict]) -> None
-        session.execute(ServiceTableInsert().values(data))
+        try:
+            session.execute(ServiceTableInsert().values(data))
+        except IntegrityError:
+            # This can be ignored because it is possible that there will be
+            # more than one server trying to insert rows related to services
+            # that are hot-deployed from web-admin or another source.
+            logger.debug('Ignoring IntegrityError with `%s`', data)
 
 # ################################################################################################################################
 
     def add_deployed_services(self, session, data):
         # type: (List[dict]) -> None
         session.execute(DeployedServiceInsert().values(data))
+
+# ################################################################################################################################
+
+    def drop_deployed_services_by_name(self, session, service_id_list):
+        session.execute(
+            DeployedServiceDelete().\
+            where(DeployedService.service_id.in_(service_id_list))
+        )
 
 # ################################################################################################################################
 

@@ -25,6 +25,7 @@ from zato.cli import common_odb_opts, is_arg_given, ZatoCommand
 from zato.common import CACHE, CONNECTION, DATA_FORMAT, IPC, MISC, PUBSUB, SIMPLE_IO, URL_TYPE
 from zato.common.odb.model import CacheBuiltin, Cluster, HTTPBasicAuth, HTTPSOAP, PubSubEndpoint, \
      PubSubSubscription, PubSubTopic, RBACClientRole, RBACPermission, RBACRole, RBACRolePermission, Service, WSSDefinition
+from zato.common.odb.post_process import ODBPostProcess
 from zato.common.pubsub import new_sub_key
 from zato.common.util import get_http_json_channel, get_http_soap_channel
 from zato.common.util.json_ import dumps
@@ -475,12 +476,13 @@ class Create(ZatoCommand):
         session = self._get_session(engine)
 
         if engine.dialect.has_table(engine.connect(), 'install_state'):
-            if is_arg_given(args, 'skip-if-exists'):
+            if is_arg_given(args, 'skip-if-exists', 'skip_if_exists'):
                 if show_output:
                     if self.verbose:
                         self.logger.debug('Cluster already exists, skipped its creation')
                     else:
                         self.logger.info('OK')
+                return
 
         with session.no_autoflush:
 
@@ -493,6 +495,9 @@ class Create(ZatoCommand):
                   'broker_host', 'broker_port', 'lb_host', 'lb_port', 'lb_agent_port'):
                 setattr(cluster, name, getattr(args, name))
             session.add(cluster)
+
+            # With a cluster object in place, we can construct the ODB post-processor
+            odb_post_process = ODBPostProcess(session, cluster, None)
 
             # admin.invoke user's password may be possibly in one of these attributes,
             # but if it is now, generate a new one.
@@ -542,6 +547,9 @@ class Create(ZatoCommand):
             # SSO
             self.add_sso_endpoints(session, cluster)
 
+            # Run ODB post-processing tasks
+            odb_post_process.run()
+
         try:
             session.commit()
         except IntegrityError as e:
@@ -565,7 +573,8 @@ class Create(ZatoCommand):
 
     def add_api_invoke(self, session, cluster, service, pubapi_sec):
         channel = HTTPSOAP(None, '/zato/api/invoke', True, True, 'channel', 'plain_http',
-            None, '/zato/api/invoke/{service_name}', None, '', None, None, merge_url_params_req=True, service=service,
+            None, '/zato/api/invoke/{service_name}', None, '', None, None,
+            merge_url_params_req=True, service=service, security=pubapi_sec,
             cluster=cluster)
         session.add(channel)
 
